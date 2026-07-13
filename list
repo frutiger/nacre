@@ -1,0 +1,7 @@
+#!/bin/sh
+set -euo pipefail
+
+ls | while read path; do
+	[ $path = ${path%.git}.git ] && echo ${path%.git}
+done
+

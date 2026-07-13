@@ -1,0 +1,14 @@
+#!/bin/sh
+set -euo pipefail
+
+[ $# -lt 1 ] \
+	&& echo "Usage: $(basename $0) <name>" \
+	&& exit 1
+[ "${1#*/}" != "$1" ] \
+	&& echo "Usage: $(basename $0) <name>, / not permitted in <name>" \
+	&& exit 1
+[ -e "$1.git" ] \
+	&& echo "$1 already exists" \
+	&& exit 1
+git init --bare "$1.git"
+
