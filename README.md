@@ -1,6 +1,6 @@
 # nacre
 
-A set of git-shell-commandso create and enumerate repositories.
+A set of git-shell-commands to create and enumerate repositories.
 
 ## Commands
 
