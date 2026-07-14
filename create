@@ -13,5 +13,4 @@ set -euo pipefail
 [ -e "$1.git" ] \
 	&& echo "$1 already exists" \
 	&& exit 1
-git init --bare "$1.git"
-
+git init --bare -b main "$1.git"
