@@ -18,7 +18,8 @@ List the possible commands.
 create <name>
 ```
 
-Create a new repository with a valid name.
+Create a new bare repository `<name>.git`, with `main` as its default branch.
+`<name>` may not contain `/` or start with `.`.
 
 ### `list`
 

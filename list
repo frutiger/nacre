@@ -1,7 +1,7 @@
 #!/bin/sh
 set -euo pipefail
 
-ls | while read path; do
-	[ $path = ${path%.git}.git ] && echo ${path%.git}
+for path in *.git; do
+	[ -d "$path" ] || continue
+	echo "${path%.git}"
 done
-

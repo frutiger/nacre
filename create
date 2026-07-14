@@ -7,6 +7,9 @@ set -euo pipefail
 [ "${1#*/}" != "$1" ] \
 	&& echo "Usage: $(basename $0) <name>, / not permitted in <name>" \
 	&& exit 1
+[ "${1#.}" != "$1" ] \
+	&& echo "Usage: $(basename $0) <name>, <name> may not start with ." \
+	&& exit 1
 [ -e "$1.git" ] \
 	&& echo "$1 already exists" \
 	&& exit 1
