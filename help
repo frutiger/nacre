@@ -1,6 +1,6 @@
 #!/bin/sh
 set -euo pipefail
 
-echo "create <name>   create a repository"
-echo "help            show this help"
-echo "list            list all repositories" 
+echo "help                        show this help"
+echo "create <name>               create a repository"
+echo "list                        list all repositories" 
