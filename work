@@ -1,0 +1,977 @@
+#!/usr/bin/env python3
+"""nacre work: sandboxed, network-policed agent sessions inside bare repos.
+
+Layout, per project (one directory under the repo's nacre/):
+    ~/<repo>.git/nacre/<proj>/worktree   working checkout (detached HEAD)
+    ~/<repo>.git/nacre/<proj>/hosts      host policy ("- h" / "+ h", denies first)
+    ~/<repo>.git/nacre/<proj>/pending/   hosts parked by the proxy, awaiting a
+                                         decision (content: requested resource)
+    ~/<repo>.git/nacre/<proj>/agent      agent type, written once by new
+    ~/<repo>.git/nacre/<proj>/log        session + proxy log
+    ~/<repo>.git/nacre/<proj>/pid        session pid (bwrap process group)
+    ~/<repo>.git/nacre/<proj>/proxy.pid  proxy pid
+    ~/<repo>.git/nacre/<proj>/sock       proxy unix socket
+
+The session runs inside bwrap with no network namespace; the only route out
+is a socat bridge to the proxy socket, and the proxy enforces .hosts.
+.hosts is the source of truth; .pending/ is only a hint queue.
+
+The proxy is this same file, re-invoked with the hidden _serve verb: a
+separate script would show up as a git-shell command of its own.
+"""
+
+import asyncio
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import ssl
+import stat
+import subprocess
+import sys
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import NoReturn
+
+USAGE = """\
+work          browse repositories and their projects
+work <repo>   work on the projects under one repository
+
+Everything is menu-driven: pick a repository, then a project (or "new"),
+then an action (watch, resume, stop, erase, edit hosts, show hosts, log).
+"""
+
+NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
+LABEL = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+PATTERN_RE = re.compile(rf"^(?:\*\.)?{LABEL}(?:\.{LABEL})*$")
+HOST_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
+PROXY_PORT = 3128
+SANDBOX_SOCK = "/run/nacre.sock"
+ALLOWED_PORTS = frozenset({443})   # CONNECT tunnels
+HTTP_PORTS = frozenset({80})       # forwarded plain-HTTP requests
+POLICY_POLL_S = 0.25
+PARK_TIMEOUT_S = 300           # parked connections give up (403) after this
+
+
+def die(msg: str) -> NoReturn:
+    print(msg, file=sys.stderr)
+    raise SystemExit(1)
+
+
+# ---------------------------------------------------------------- policy
+
+@dataclass(frozen=True)
+class Entry:
+    allow: bool
+    pattern: str
+
+    def line(self) -> str:
+        return f"{'+' if self.allow else '-'} {self.pattern}"
+
+
+def parse_policy(text: str) -> tuple[list[Entry], list[str]]:
+    """Parse a .hosts file. Returns (entries, errors); errors mention lines.
+
+    Grammar: blank lines and #-comments are ignored; every other line is
+    '+ <pattern>' or '- <pattern>' where <pattern> is a lowercase hostname,
+    optionally starting with '*.'. Duplicates are refused, and all deny
+    lines must precede all allow lines so the file reads in precedence
+    order (semantically deny always wins, in any order).
+    """
+    entries: list[Entry] = []
+    errors: list[str] = []
+    seen: dict[str, int] = {}
+    saw_allow = False
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if len(line) < 3 or line[0] not in "+-" or line[1] != " ":
+            errors.append(f"line {n}: expected '+ <host>' or '- <host>': {line}")
+            continue
+        allow, pattern = line[0] == "+", line[2:]
+        if not PATTERN_RE.match(pattern):
+            errors.append(f"line {n}: bad host pattern: {pattern}")
+            continue
+        if pattern in seen:
+            errors.append(f"line {n}: duplicate of line {seen[pattern]}: {pattern}")
+            continue
+        seen[pattern] = n
+        if allow:
+            saw_allow = True
+        elif saw_allow:
+            errors.append(f"line {n}: deny lines must come before allow lines: {line}")
+            continue
+        entries.append(Entry(allow, pattern))
+    return entries, errors
+
+
+def matches(host: str, pattern: str) -> bool:
+    if pattern.startswith("*."):
+        return host.endswith(pattern[1:])
+    return host == pattern
+
+
+def decide(entries: list[Entry], host: str) -> str:
+    """'allow' | 'deny' | 'unknown'; deny wins over allow."""
+    allowed = False
+    for e in entries:
+        if matches(host, e.pattern):
+            if not e.allow:
+                return "deny"
+            allowed = True
+    return "allow" if allowed else "unknown"
+
+
+class Policy:
+    """Live view of a .hosts file, re-read on every use. Invalid lines
+    grant nothing (fail closed); they are refused loudly everywhere the
+    file is written or a session is started."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def read(self) -> list[Entry]:
+        try:
+            text = self.path.read_text()
+        except OSError:
+            return []
+        entries, _errors = parse_policy(text)
+        return entries
+
+    def validate(self, context: str) -> None:
+        """Refuse (exit) if the policy file is malformed; a missing file
+        is fine (an empty policy just parks everything)."""
+        try:
+            text = self.path.read_text()
+        except OSError:
+            return
+        _entries, errors = parse_policy(text)
+        if errors:
+            for e in errors:
+                print(f"{self.path.name}: {e}", file=sys.stderr)
+            die(f"{context}: refusing to continue with a malformed host "
+                f"policy (fix it with the project's 'edit hosts' action)")
+
+    def decide(self, host: str) -> str:
+        return decide(self.read(), host)
+
+
+# ---------------------------------------------------------------- project
+
+@dataclass(frozen=True)
+class Project:
+    repo: str
+    proj: str
+
+    @property
+    def name(self) -> str:
+        return f"{self.repo}/{self.proj}"
+
+    @property
+    def gitdir(self) -> Path:
+        return Path.home() / f"{self.repo}.git"
+
+    @property
+    def dir(self) -> Path:
+        """The project's container directory."""
+        return self.gitdir / "nacre" / self.proj
+
+    @property
+    def worktree(self) -> Path:
+        return self.dir / "worktree"
+
+    @property
+    def hosts(self) -> Path:
+        return self.dir / "hosts"
+
+    @property
+    def pending(self) -> Path:
+        return self.dir / "pending"
+
+    @property
+    def agent(self) -> Path:
+        return self.dir / "agent"
+
+    @property
+    def log(self) -> Path:
+        return self.dir / "log"
+
+    @property
+    def pid(self) -> Path:
+        return self.dir / "pid"
+
+    @property
+    def proxy_pid(self) -> Path:
+        return self.dir / "proxy.pid"
+
+    @property
+    def sock(self) -> Path:
+        return self.dir / "sock"
+
+    def policy(self) -> Policy:
+        return Policy(self.hosts)
+
+
+def read_pid(path: Path) -> int | None:
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def alive(p: Project) -> bool:
+    pid = read_pid(p.pid)
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)  # signal 0: existence check only
+    except OSError:
+        return False
+    return True
+
+
+def write_policy(p: Project, mutate: Callable[[list[Entry]], list[Entry]]) -> None:
+    """Locked read-modify-write of .hosts, rewritten in canonical order
+    (denies first). Refuses if the current file is malformed: programmatic
+    writes never paper over a broken policy."""
+    lock = p.dir / "hosts.lock"
+    with open(lock, "w") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        p.policy().validate("policy update")
+        entries = mutate(p.policy().read())
+        ordered = [e for e in entries if not e.allow] + [e for e in entries if e.allow]
+        text = "".join(e.line() + "\n" for e in ordered)
+        # never let a programmatic write leave a policy the parser would reject:
+        # a malformed .hosts fails validation and blocks the next session start
+        _entries, errors = parse_policy(text)
+        if errors:
+            die(f"policy update: refusing to write a malformed policy ({errors[0]})")
+        tmp = p.dir / "hosts.tmp"
+        tmp.write_text(text)
+        # atomic replace: the proxy always reads a complete file
+        os.replace(tmp, p.hosts)
+
+
+def set_policy(p: Project, allow: bool, pattern: str) -> None:
+    def mutate(entries: list[Entry]) -> list[Entry]:
+        kept = [e for e in entries if e.pattern != pattern]
+        return kept + [Entry(allow, pattern)]
+
+    # policy first, pending second: .hosts is the source of truth, and a
+    # crash between the two only leaves a stale hint that watch reconciles
+    write_policy(p, mutate)
+    (p.pending / pattern).unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- agent types
+
+@dataclass(frozen=True)
+class AgentType:
+    seed: tuple[str, ...]          # initial allowed hosts
+    state_dirs: tuple[str, ...]    # $HOME-relative dirs bound writable
+    state_files: tuple[str, ...]   # $HOME-relative files bound writable
+
+    def command(self, name: str, resume: bool) -> list[str]:
+        raise NotImplementedError
+
+    def prepare(self, project_dir: Path) -> None:
+        """Hook run outside the sandbox before each launch."""
+
+
+@dataclass(frozen=True)
+class ClaudeAgent(AgentType):
+    def command(self, name: str, resume: bool) -> list[str]:
+        cmd = ["claude", "remote-control"]
+        if resume:
+            cmd.append("--continue")
+        return cmd + ["--name", name]
+
+    def prepare(self, project_dir: Path) -> None:
+        # claude refuses to launch headless in an untrusted workspace and
+        # has no unattended-trust flag, so pre-accept the trust dialog the
+        # way accepting it interactively would: in ~/.claude.json
+        cfg = Path.home() / ".claude.json"
+        try:
+            data = json.loads(cfg.read_text())
+        except (OSError, ValueError):
+            data = {}
+        proj = data.setdefault("projects", {}).setdefault(str(project_dir), {})
+        if not proj.get("hasTrustDialogAccepted"):
+            proj["hasTrustDialogAccepted"] = True
+            cfg.write_text(json.dumps(data, indent=2))
+
+
+AGENT_TYPES: dict[str, AgentType] = {
+    "claude": ClaudeAgent(
+        seed=("api.anthropic.com",),
+        state_dirs=(".claude",),
+        state_files=(".claude.json",),
+    ),
+}
+
+
+# ---------------------------------------------------------------- session
+
+def start_session(p: Project, resume: bool) -> None:
+    if alive(p):
+        print("session already running")
+        return
+    # validate only: refuses to launch on a malformed policy file
+    p.policy().validate("session start")
+    type_name = p.agent.read_text().strip()
+    agent_type = AGENT_TYPES.get(type_name)
+    if agent_type is None:
+        die(f"unknown agent type: {type_name}")
+
+    home = Path.home()
+    binds: list[str] = []
+    for d in agent_type.state_dirs:
+        (home / d).mkdir(exist_ok=True)
+        binds += ["--bind", str(home / d), str(home / d)]
+    for f in agent_type.state_files:
+        (home / f).touch()
+        binds += ["--bind", str(home / f), str(home / f)]
+
+    p.pending.mkdir(exist_ok=True)
+    p.sock.unlink(missing_ok=True)
+    log = open(p.log, "ab")
+    self_path = os.path.abspath(__file__)
+    proxy = subprocess.Popen(
+        [self_path, "_serve", str(p.sock), str(p.hosts), str(p.pending)],
+        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    p.proxy_pid.write_text(f"{proxy.pid}\n")
+    # the socket appearing is the proxy's readiness signal
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            if stat.S_ISSOCK(os.stat(p.sock).st_mode):
+                break
+        except OSError:
+            pass
+        if time.monotonic() > deadline:
+            die(f"proxy failed to start (see {p.log})")
+        time.sleep(0.1)
+
+    agent_type.prepare(p.worktree)
+    run = agent_type.command(p.name, resume)
+    # resolve the binary out here: the sandbox inherits a PATH it may not
+    # be able to satisfy, and a clear early error beats one in the log
+    exe = shutil.which(run[0])
+    if exe is None:
+        die(f"{run[0]} not found on PATH")
+    run = [exe, *run[1:]]
+    # inside the sandbox: bring loopback up (fresh netns has lo down, hence
+    # CAP_NET_ADMIN), bridge a local TCP port to the proxy socket, and make
+    # that the agent's HTTP(S) proxy
+    inner = (
+        "ip link set lo up; "
+        f"socat TCP-LISTEN:{PROXY_PORT},fork,reuseaddr,bind=127.0.0.1 "
+        f"UNIX-CONNECT:{SANDBOX_SOCK} & exec {shlex.join(run)}"
+    )
+    # the canonical repo stays read-only inside the sandbox; only the
+    # checkout and the agent's own state are writable, and the proxy
+    # socket is the sole route out of the network namespace
+    argv = [
+        "bwrap",
+        "--ro-bind", "/", "/",
+        "--dev", "/dev", "--proc", "/proc",
+        "--tmpfs", "/tmp", "--tmpfs", "/run",
+        "--bind", str(p.worktree), str(p.worktree),
+        *binds,
+        "--bind", str(p.sock), SANDBOX_SOCK,
+        # --cap-add only takes effect together with an explicit
+        # --unshare-user; without it, lo cannot be brought up
+        "--unshare-user", "--unshare-net", "--unshare-pid",
+        "--cap-add", "CAP_NET_ADMIN",
+        "--setenv", "HTTP_PROXY", f"http://127.0.0.1:{PROXY_PORT}",
+        "--setenv", "HTTPS_PROXY", f"http://127.0.0.1:{PROXY_PORT}",
+        "--chdir", str(p.worktree),
+        "sh", "-c", inner,
+    ]
+    session = subprocess.Popen(
+        argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    p.pid.write_text(f"{session.pid}\n")
+    print(f"started {type_name} session {p.name}")
+
+
+def stop_session(p: Project) -> None:
+    pid = read_pid(p.pid)
+    if pid is not None and alive(p):
+        try:
+            # start_new_session made the session its own process group;
+            # signal the whole group so socat and children die too
+            os.killpg(pid, 15)
+        except OSError:
+            pass
+        print(f"stopped {p.name}")
+    else:
+        print(f"{p.name} was not running")
+    proxy_pid = read_pid(p.proxy_pid)
+    if proxy_pid is not None:
+        try:
+            os.kill(proxy_pid, 15)
+        except OSError:
+            pass
+    for f in (p.pid, p.proxy_pid, p.sock):
+        f.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- verbs
+
+def check_name(name: str) -> str:
+    if not NAME_RE.match(name):
+        die(f"bad name: {name} (letters, digits, . _ -; no leading .)")
+    return name
+
+
+def wildcard_of(host: str) -> str:
+    parts = host.split(".")
+    return "*." + ".".join(parts[1:]) if len(parts) > 2 else f"*.{host}"
+
+
+def cmd_watch(p: Project) -> None:
+    # validate only: no point watching on behalf of a broken policy
+    p.policy().validate("watch")
+    p.pending.mkdir(exist_ok=True)
+    print(f"watching {p.name} (ctrl-c returns to the menu; the session keeps "
+          f"running)")
+    try:
+        while True:
+            for f in sorted(p.pending.iterdir()):
+                host = f.name
+                # already decided (via edit, or a crash between policy
+                # write and pending unlink): just clear the hint
+                if p.policy().decide(host) != "unknown":
+                    f.unlink(missing_ok=True)
+                    continue
+                try:
+                    resource = f.read_text().strip()
+                except OSError:
+                    resource = ""
+                info = f"  {resource}" if resource else ""
+                ans = input(f"? {host}{info}\n"
+                            f"  [a]llow [d]eny [w]ildcard [s]kip: ").strip()
+                if ans.startswith("a"):
+                    set_policy(p, True, host)
+                    print(f"+ {host}")
+                elif ans.startswith("d"):
+                    set_policy(p, False, host)
+                    print(f"- {host}")
+                elif ans.startswith("w"):
+                    w = wildcard_of(host)
+                    if w == f"*.{host}":
+                        # apex host: the wildcard alone would not match it
+                        set_policy(p, True, host)
+                    set_policy(p, True, w)
+                    f.unlink(missing_ok=True)
+                    print(f"+ {w}")
+                elif ans.startswith("s"):
+                    # skip: 403 this time, parks again on the next attempt
+                    f.unlink(missing_ok=True)
+            time.sleep(1)
+    except (KeyboardInterrupt, EOFError):
+        print(f"\ndetached from {p.name}")
+
+
+def cmd_edit(p: Project) -> None:
+    """Transactional $EDITOR on the policy: the draft only replaces .hosts
+    once it validates, so an invalid policy never lands on disk."""
+    editor = shlex.split(os.environ.get("EDITOR", "vi"))
+    draft = p.dir / "hosts.edit"
+    if p.hosts.exists():
+        shutil.copy(p.hosts, draft)
+    else:
+        draft.write_text("")
+    try:
+        while True:
+            subprocess.run(editor + [str(draft)], check=False)
+            _entries, errors = parse_policy(draft.read_text())
+            if not errors:
+                break
+            for e in errors:
+                print(e, file=sys.stderr)
+            ans = input("[e]dit again or [a]bandon? ").strip()
+            if not ans.startswith("e"):
+                print("abandoned; policy unchanged")
+                return
+        # validated draft installed as-is: comments and (checked) order
+        # are the user's
+        os.replace(draft, p.hosts)
+    finally:
+        draft.unlink(missing_ok=True)
+
+
+def cmd_erase(p: Project) -> None:
+    """Delete the checkout and every metadata sibling. Refuses on a live
+    session; confirms when work would be lost, since the checkout may hold
+    the only copy of the project's commits."""
+    if alive(p):
+        die(f"{p.name} is running; stop it first")
+    at_risk: list[str] = []
+    r = subprocess.run(
+        ["git", "-C", str(p.worktree), "status", "--porcelain"],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        at_risk.append("uncommitted changes")
+    # commits reachable from HEAD but on no remote branch exist only here
+    r = subprocess.run(
+        ["git", "-C", str(p.worktree), "rev-list", "HEAD", "--not", "--remotes"],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        at_risk.append(f"{len(r.stdout.split())} commit(s) not in {p.repo}.git")
+    if at_risk:
+        print(f"{p.name} has {' and '.join(at_risk)}")
+        if not input(f"erase {p.name} anyway? [y/N] ").strip().startswith("y"):
+            print("not erased")
+            return
+    shutil.rmtree(p.dir)
+    print(f"erased {p.name}")
+
+
+def cmd_hosts(p: Project) -> None:
+    if p.hosts.exists():
+        sys.stdout.write(p.hosts.read_text())
+    policy = p.policy()
+    if p.pending.is_dir():
+        for f in sorted(p.pending.iterdir()):
+            if policy.decide(f.name) == "unknown":
+                print(f"? {f.name}")
+
+
+def cmd_log(p: Project) -> None:
+    if not p.log.exists():
+        print(f"{p.name} has no log yet")
+        return
+    with open(p.log, "rb") as f:
+        shutil.copyfileobj(f, sys.stdout.buffer)
+
+
+def cmd_new(p: Project, type_name: str) -> None:
+    agent_type = AGENT_TYPES.get(type_name)
+    if agent_type is None:
+        die(f"unknown agent type: {type_name} "
+            f"(available: {', '.join(sorted(AGENT_TYPES))})")
+    if not p.gitdir.is_dir():
+        die(f"no such repo: {p.repo} (try: create {p.repo})")
+    if p.dir.exists():
+        die(f"{p.name} already exists")
+    p.pending.mkdir(parents=True, exist_ok=True)
+    # full copy, not hardlinks: a session must not share inodes with the
+    # canonical repo's object store
+    subprocess.run(
+        ["git", "clone", "--no-hardlinks", str(p.gitdir), str(p.worktree)],
+        check=True,
+    )
+    # leave the checkout on a detached HEAD: nacre never creates a project
+    # branch, and sync integrates by HEAD. A freshly created repo clones with
+    # an unborn HEAD (nothing to detach); the agent's first commit starts it.
+    if subprocess.run(
+        ["git", "-C", str(p.worktree), "rev-parse", "-q", "--verify", "HEAD"],
+        capture_output=True,
+    ).returncode == 0:
+        subprocess.run(
+            ["git", "-C", str(p.worktree), "switch", "--detach"], check=True,
+        )
+    p.agent.write_text(f"{type_name}\n")
+    p.hosts.write_text(
+        "# nacre host policy: '- host' denies, '+ host' allows; denies come\n"
+        "# first, and deny wins. '*.example.com' matches subdomains.\n"
+        + "".join(f"+ {h}\n" for h in agent_type.seed)
+    )
+    start_session(p, resume=False)
+    cmd_watch(p)
+
+
+# ---------------------------------------------------------------- menus
+
+def choose(header: str, items: list[str]) -> int | None:
+    """Print a numbered menu and return the chosen 0-based index, or None
+    if the user backs out (blank line, ctrl-c, ctrl-d)."""
+    if not items:
+        return None
+    print(header)
+    for i, label in enumerate(items, 1):
+        print(f"{i:>3}. {label}")
+    while True:
+        try:
+            ans = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not ans:
+            return None
+        if ans.isdigit() and 1 <= int(ans) <= len(items):
+            return int(ans) - 1
+        print(f"  pick 1-{len(items)}, or blank to go back")
+
+
+def projects_of(repo: str) -> list[Project]:
+    """Every real project under a repo (those with an agent file), sorted."""
+    base = Path.home() / f"{repo}.git" / "nacre"
+    if not base.is_dir():
+        return []
+    out = []
+    for d in sorted(base.iterdir()):
+        p = Project(repo, d.name)
+        # only real projects have an agent file
+        if d.is_dir() and p.agent.is_file():
+            out.append(p)
+    return out
+
+
+def list_repos() -> list[str]:
+    """Every repository (bare *.git under home), by name, sorted."""
+    return [g.name.removesuffix(".git")
+            for g in sorted(Path.home().glob("*.git")) if g.is_dir()]
+
+
+def repo_label(repo: str) -> str:
+    """A repo's menu label, tagged running/total once it has projects."""
+    projs = projects_of(repo)
+    running = sum(alive(p) for p in projs)
+    return f"{repo}  ({running}/{len(projs)} running)" if projs else repo
+
+
+def project_label(p: Project) -> str:
+    """A project's menu label, tagged running/stopped."""
+    return f"{p.proj}  ({'running' if alive(p) else 'stopped'})"
+
+
+def choose_repo(header: str) -> str | None:
+    """Pick a repository from the menu; None if there are none or the user
+    backs out. Shared by `work` and `sync`."""
+    repos = list_repos()
+    if not repos:
+        print("no repositories yet (create one with: create <name>)")
+        return None
+    i = choose(header, [repo_label(r) for r in repos])
+    return repos[i] if i is not None else None
+
+
+def repo_picker() -> None:
+    """Top level: pick a repository, then drop into its menu."""
+    while True:
+        repo = choose_repo("repositories:")
+        if repo is None:
+            return
+        repo_menu(repo)
+
+
+def repo_menu(repo: str) -> None:
+    """One repository: create a project, or pick one to manage."""
+    if not (Path.home() / f"{repo}.git").is_dir():
+        die(f"no such repo: {repo} (try: create {repo})")
+    while True:
+        projs = projects_of(repo)
+        labels = ["new project", *(project_label(p) for p in projs)]
+        i = choose(f"{repo}:", labels)
+        if i is None:
+            return
+        if i == 0:
+            new_project(repo)
+        else:
+            project_menu(projs[i - 1])
+
+
+def default_name(repo: str) -> str:
+    """A fresh 'projN' name, counting up past the existing projects and
+    skipping any number already taken."""
+    n = len(projects_of(repo)) + 1
+    while Project(repo, f"proj{n}").dir.exists():
+        n += 1
+    return f"proj{n}"
+
+
+def new_project(repo: str) -> None:
+    """Prompt for a name (and type, when there's a choice), then create.
+    Blank accepts the suggested default; ctrl-c cancels."""
+    suggestion = default_name(repo)
+    while True:
+        try:
+            name = input(f"new project name [{suggestion}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        name = name or suggestion
+        if not NAME_RE.match(name):
+            print("  letters, digits, . _ - only; no leading .")
+            continue
+        p = Project(repo, name)
+        if p.dir.exists():
+            print(f"  {p.name} already exists")
+            continue
+        break
+    types = sorted(AGENT_TYPES)
+    if len(types) == 1:
+        type_name = types[0]
+    else:
+        j = choose("agent type:", types)
+        if j is None:
+            return
+        type_name = types[j]
+    cmd_new(p, type_name)
+
+
+def project_menu(p: Project) -> None:
+    """One project: only the actions valid in its current state are shown."""
+    while True:
+        running = alive(p)
+        actions: list[tuple[str, Callable[[], None]]] = []
+        if running:
+            actions.append(("watch", lambda: cmd_watch(p)))
+            actions.append(("stop", lambda: stop_session(p)))
+        else:
+            actions.append(("resume", lambda: resume(p)))
+            actions.append(("erase", lambda: cmd_erase(p)))
+        actions.append(("edit hosts", lambda: cmd_edit(p)))
+        actions.append(("show hosts", lambda: cmd_hosts(p)))
+        actions.append(("show log", lambda: cmd_log(p)))
+        i = choose(f"{p.name}  ({'running' if running else 'stopped'}):",
+                   [label for label, _ in actions])
+        if i is None:
+            return
+        actions[i][1]()
+        # erase removes the project directory; nothing left to manage
+        if not p.dir.is_dir():
+            return
+
+
+def resume(p: Project) -> None:
+    start_session(p, resume=True)
+    cmd_watch(p)
+
+
+# ---------------------------------------------------------------- proxy
+
+def proxy_log(msg: str) -> None:
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} proxy: {msg}", flush=True)
+
+
+async def relay(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        while True:
+            data = await reader.read(65536)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except OSError:
+        pass
+    finally:
+        # propagate EOF (half-close) so protocols that shut down one
+        # direction first keep working. An SSL transport (the absolute-form
+        # https upstream) can't half-close — its write_eof() raises
+        # NotImplementedError, not OSError — so only call it when supported.
+        try:
+            if writer.can_write_eof():
+                writer.write_eof()
+        except OSError:
+            pass
+
+
+async def serve_client(
+    policy: Policy,
+    pending: Path,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+) -> None:
+    async def refuse(status: str) -> None:
+        writer.write(f"HTTP/1.1 {status}\r\n\r\n".encode())
+        try:
+            await writer.drain()
+        except OSError:
+            pass
+        writer.close()
+
+    try:
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=30)
+    except (asyncio.IncompleteReadError, asyncio.LimitOverrunError,
+            TimeoutError, OSError):
+        writer.close()
+        return
+    line = head.split(b"\r\n", 1)[0].decode("latin1", "replace")
+    out_head = b""
+    use_tls = False
+    resource = ""   # display hint for watch; only absolute-form has a path
+    if m := re.match(r"^CONNECT ([^\s:]+):(\d+) ", line):
+        is_connect = True
+        host, port = m.group(1).lower(), int(m.group(2))
+        allowed_ports = ALLOWED_PORTS
+        # a CONNECT tunnel exposes only host:port; the path is inside TLS
+    elif m := re.match(
+        r"^([A-Z]+) (https?)://([^/\s:]+)(?::(\d+))?(/\S*)? HTTP/", line,
+    ):
+        # absolute-form request: some clients (claude's remote-control
+        # bridge among them) send these instead of CONNECT and expect the
+        # proxy to originate the connection — TLS included for https.
+        # Forwarded under the same host policy.
+        is_connect = False
+        use_tls = m.group(2) == "https"
+        host = m.group(3).lower()
+        port = int(m.group(4)) if m.group(4) else (443 if use_tls else 80)
+        allowed_ports = ALLOWED_PORTS if use_tls else HTTP_PORTS
+        resource = f"{m.group(1)} {m.group(2)}://{host}{m.group(5) or '/'}"
+        # rewrite to origin-form and pin Connection: close, so the one
+        # policy decision covers exactly one request on this socket
+        parts = head.decode("latin1", "replace").split("\r\n")
+        keep = [
+            h for h in parts[1:] if h
+            and not h.lower().startswith(("connection:", "proxy-connection:"))
+        ]
+        if not any(h.lower().startswith("host:") for h in keep):
+            keep.insert(0, f"Host: {host}")
+        out_head = "\r\n".join(
+            [f"{m.group(1)} {m.group(5) or '/'} HTTP/1.1",
+             *keep, "Connection: close", "", ""]
+        ).encode("latin1")
+    else:
+        proxy_log(f"refuse: {line!r}")
+        await refuse("400 Bad Request")
+        return
+    # the host doubles as a pending filename and, once allowed, a policy
+    # pattern; require PATTERN_RE too so a later 'allow' can't write a line the
+    # parser would reject (which would then wedge the session on its next start)
+    if not HOST_RE.match(host) or not PATTERN_RE.match(host) or ".." in host:
+        await refuse("400 Bad Request")
+        return
+    if port not in allowed_ports:
+        proxy_log(f"deny {host}:{port} (port not allowed)")
+        await refuse("403 Forbidden")
+        return
+
+    verdict = policy.decide(host)
+    if verdict == "unknown":
+        # park: leave the request unanswered until a decision lands in the
+        # policy file, or time out with a 403; the pending entry survives
+        # either way so a late decision covers the retry. Client bytes sent
+        # meanwhile wait in the kernel socket buffer until relay() starts.
+        pending.mkdir(exist_ok=True)
+        # the filename is the policy key (the host); the content is only a
+        # display hint for watch: the request target (empty for a CONNECT
+        # tunnel), kept to printable characters since it is client-controlled
+        hint = "".join(c for c in resource if c.isprintable())[:200]
+        (pending / host).write_text(hint + "\n")
+        proxy_log(f"park {host}")
+        deadline = time.monotonic() + PARK_TIMEOUT_S
+        while verdict == "unknown" and time.monotonic() < deadline:
+            await asyncio.sleep(POLICY_POLL_S)
+            verdict = policy.decide(host)
+
+    if verdict != "allow":
+        proxy_log(f"deny {host}")
+        await refuse("403 Forbidden")
+        return
+    try:
+        # DNS resolves here, outside the sandbox: the sandbox needs none.
+        # For absolute-form https the proxy is the TLS client, with default
+        # (validating) certificate checks.
+        up_reader, up_writer = await asyncio.open_connection(
+            host, port, ssl=ssl.create_default_context() if use_tls else None,
+        )
+    except (OSError, ssl.SSLError) as e:
+        proxy_log(f"unreachable {host}: {e}")
+        await refuse("502 Bad Gateway")
+        return
+    proxy_log(f"allow {host}:{port}")
+    if is_connect:
+        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+    else:
+        # plain HTTP: no proxy response of our own; forward the rewritten
+        # request and relay the origin's response back verbatim
+        up_writer.write(out_head)
+    await asyncio.gather(relay(reader, up_writer), relay(up_reader, writer))
+    up_writer.close()
+    writer.close()
+
+
+async def run_proxy(sock: Path, hosts: Path, pending: Path) -> None:
+    policy = Policy(hosts)
+
+    async def handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        try:
+            await serve_client(policy, pending, r, w)
+        except Exception as e:  # a bad client must not kill the proxy
+            proxy_log(f"error: {e}")
+            w.close()
+
+    sock.unlink(missing_ok=True)
+    server = await asyncio.start_unix_server(handler, path=str(sock))
+    proxy_log(f"listening on {sock}")
+    async with server:
+        await server.serve_forever()
+
+
+# ---------------------------------------------------------------- main
+
+def grab_terminal() -> tuple[int, int] | None:
+    """Move into our own process group and take the controlling terminal's
+    foreground. git-shell runs no job control, so it launches us in *its*
+    process group; a terminal ctrl-c would then signal git-shell too and drop
+    the whole ssh session, even though we catch the signal ourselves (watch
+    returns to the menu). Owning the foreground group keeps ctrl-c to us.
+
+    Returns state for restore_terminal(), or None when there is no tty to grab.
+    """
+    try:
+        fd = sys.stdin.fileno()
+        if not os.isatty(fd):
+            return None
+        prev = os.tcgetpgrp(fd)   # git-shell's group, to hand back on exit
+    except (OSError, ValueError):
+        return None
+    try:
+        os.setpgrp()
+        # tcsetpgrp from a not-yet-foreground group raises SIGTTOU at us
+        prev_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        try:
+            os.tcsetpgrp(fd, os.getpgrp())
+        finally:
+            signal.signal(signal.SIGTTOU, prev_ttou)
+    except OSError:
+        return None
+    return fd, prev
+
+
+def restore_terminal(state: tuple[int, int] | None) -> None:
+    if state is None:
+        return
+    fd, prev = state
+    prev_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    try:
+        os.tcsetpgrp(fd, prev)
+    except OSError:
+        pass
+    finally:
+        signal.signal(signal.SIGTTOU, prev_ttou)
+
+
+def main(argv: list[str]) -> None:
+    if len(argv) == 5 and argv[1] == "_serve":
+        asyncio.run(run_proxy(Path(argv[2]), Path(argv[3]), Path(argv[4])))
+        return
+    term = grab_terminal()
+    try:
+        if len(argv) == 1:
+            repo_picker()
+        elif len(argv) == 2:
+            repo_menu(check_name(argv[1]))
+        else:
+            die(USAGE)
+    finally:
+        restore_terminal(term)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""nacre sync: land a project's committed work into its repository, then
+erase the project.
+
+An agent can't push from inside the sandbox — the canonical repo is read-only
+there — so integration happens out here: the canonical repo fetches the
+checkout's HEAD and fast-forwards its own HEAD to it (never a rebase, and only
+when the checkout is strictly ahead). The session is then stopped and the
+checkout erased, since its work now lives in the repository.
+
+Menu-driven like `work`: `sync` picks a repo then a project; `sync <repo>`
+skips straight to the project pick.
+"""
+
+import importlib.machinery
+import importlib.util
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+USAGE = """\
+sync          pick a repository, then a project, to sync
+sync <repo>   pick a project in <repo> to sync
+
+Fast-forward a project's committed work into its repository (refusing unless
+the checkout is strictly ahead), then stop the session and erase the project.
+"""
+
+# Reuse the project model, session control, and menu helpers from `work`,
+# which sits beside this script. It has no .py suffix (it is a git-shell
+# command), so load it by path; its body is under `if __name__ == "__main__"`,
+# so importing only defines names.
+_work_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "work")
+_loader = importlib.machinery.SourceFileLoader("nacre_work", _work_path)
+_spec = importlib.util.spec_from_loader("nacre_work", _loader)
+work = importlib.util.module_from_spec(_spec)
+_loader.exec_module(work)
+
+Project = work.Project
+die = work.die
+
+
+def git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args], capture_output=True, text=True,
+    )
+
+
+def stop_and_wait(p: Project) -> None:
+    """Stop the session and wait for the sandbox to actually exit, so the
+    worktree is nobody's before we rewrite its history."""
+    pid = work.read_pid(p.pid)
+    work.stop_session(p)
+    if pid is None:
+        return
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)  # still alive?
+        except OSError:
+            return
+        time.sleep(0.1)
+
+
+def sync_project(p: Project) -> None:
+    wt = p.worktree
+    canon = p.gitdir
+
+    status = git(wt, "status", "--porcelain")
+    if status.returncode != 0:
+        die(f"{p.name}: not a git checkout ({wt})")
+    if git(wt, "rev-parse", "-q", "--verify", "HEAD").returncode != 0:
+        die(f"{p.name} has no commits yet; nothing to sync")
+    # committed work only: refuse a dirty tree rather than discard the
+    # agent's uncommitted changes. Checked before stopping, so a refusal
+    # leaves the session untouched.
+    if status.stdout.strip():
+        die(f"{p.name} has uncommitted changes; commit or discard them in the "
+            f"session first (nothing synced)")
+
+    # Pull the checkout's tip into the canonical repo (the sandbox can't push
+    # out, so integration fetches from the checkout). Reads committed history
+    # only, so it is safe while the session still runs. Everything is done
+    # against the repo's HEAD — a symbolic ref to its default branch — so the
+    # branch is never named or assumed.
+    if (r := git(canon, "fetch", str(wt), "HEAD")).returncode != 0:
+        sys.stderr.write(r.stdout + r.stderr)
+        die(f"{p.name}: could not fetch from the checkout")
+    src = git(canon, "rev-parse", "FETCH_HEAD").stdout.strip()
+    tip = git(canon, "rev-parse", "-q", "--verify", "HEAD").stdout.strip()
+
+    if tip == src:
+        n = "0"
+    elif tip:
+        # refuse anything but a pure fast-forward: the checkout must be
+        # strictly ahead of the repo's HEAD, never diverged from it
+        if git(canon, "merge-base", "--is-ancestor", tip, src).returncode != 0:
+            die(f"{p.name} has diverged from {p.repo}.git (it moved on "
+                f"independently); refusing — not a fast-forward")
+        n = git(canon, "rev-list", "--count", f"{tip}..{src}").stdout.strip()
+    else:
+        n = git(canon, "rev-list", "--count", src).stdout.strip()
+
+    running = work.alive(p)
+    verb = "stop and erase" if running else "erase"
+    ans = input(f"sync {p.name} into {p.repo}.git, then {verb} the project? "
+                f"[y/N] ").strip()
+    if not ans.lower().startswith("y"):
+        print("not synced")
+        return
+    if running:
+        stop_and_wait(p)
+
+    if n != "0":
+        # advance HEAD's branch to the checkout's tip. The old value is passed
+        # so a branch that moved since the fast-forward check fails the update
+        # rather than being clobbered; update-ref dereferences HEAD for us.
+        args = ["update-ref", "HEAD", src] + ([tip] if tip else [])
+        if (u := git(canon, *args)).returncode != 0:
+            sys.stderr.write(u.stdout + u.stderr)
+            die(f"{p.name}: could not advance {p.repo}.git (did it move "
+                f"again?). Nothing erased; sync again to retry.")
+
+    if n == "0":
+        print(f"{p.name}: already current with {p.repo}.git")
+    else:
+        print(f"synced {n} commit(s) from {p.name} into {p.repo}.git")
+    # refresh the checkout's remote-tracking refs so its landed work is now
+    # visibly in the repo; erase's `HEAD --not --remotes` guard then passes
+    # cleanly and it erases without a prompt (but still backstops us if, for
+    # any reason, something here lived only in the checkout).
+    git(wt, "fetch", "origin")
+    work.cmd_erase(p)
+
+
+# ---------------------------------------------------------------- selection
+
+def pick_project(repo: str) -> Project | None:
+    projs = work.projects_of(repo)
+    if not projs:
+        print(f"{repo}: no projects to sync")
+        return None
+    labels = [work.project_label(p) for p in projs]
+    i = work.choose(f"sync which project in {repo}?", labels)
+    return projs[i] if i is not None else None
+
+
+def pick_repo() -> str | None:
+    return work.choose_repo("sync in which repository?")
+
+
+def main(argv: list[str]) -> None:
+    # take the terminal's foreground group so ctrl-c reaches only us, not the
+    # git-shell that launched us (see work.grab_terminal)
+    term = work.grab_terminal()
+    try:
+        if len(argv) == 1:
+            repo = pick_repo()
+        elif len(argv) == 2:
+            repo = work.check_name(argv[1])
+            if not (Path.home() / f"{repo}.git").is_dir():
+                die(f"no such repo: {repo} (try: create {repo})")
+        else:
+            die(USAGE)
+        if repo is None:
+            return
+        p = pick_project(repo)
+        if p is not None:
+            sync_project(p)
+    finally:
+        work.restore_terminal(term)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

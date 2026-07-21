@@ -3,4 +3,7 @@ set -euo pipefail
 
 echo "help                        show this help"
 echo "create <name>               create a repository"
-echo "list                        list all repositories" 
+echo "list                        list all repositories"
+echo "work                        work on a repository's projects"
+echo "sync                        land a project's work and erase it"
+
