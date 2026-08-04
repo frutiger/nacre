@@ -1,6 +1,7 @@
 #!/bin/sh
 set -euo pipefail
 
+echo "update                      update these commands from their remote"
 echo "help                        show this help"
 echo "create <name>               create a repository"
 echo "list                        list all repositories"

@@ -8,6 +8,10 @@ sandboxed, network-policed agent sessions against them.
 Everything is menu-driven — pick from a numbered list; a blank line (or Ctrl-C)
 steps back out.
 
+- **`update`** — update these commands themselves: fetch their repo's remote,
+  then pick a revision reachable from the remote HEAD to switch to (`>` marks
+  the current one), 10 per page. Checkouts are detached, so this rolls
+  forward or back freely
 - **`help`** — list the commands
 - **`create <name>`** — create a bare repo `<name>.git`, asking for the
   default branch name (`main` if left blank)

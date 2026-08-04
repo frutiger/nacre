@@ -1,0 +1,87 @@
+#!/bin/sh
+set -euo pipefail
+
+# update these commands: fetch, then pick a revision reachable from the
+# remote HEAD to switch to (roll forward or back; "> " marks the current
+# one). Checkouts are detached so any revision is reachable next time.
+cd "$(dirname "$0")"
+
+page=10
+
+remote=$(git remote | head -n 1)
+[ -z "$remote" ] \
+	&& echo "no remote configured" \
+	&& exit 1
+
+git fetch "$remote"
+
+branch=$(git ls-remote --symref "$remote" HEAD | awk '$1 == "ref:" {print $2}')
+branch=${branch#refs/heads/}
+[ -z "$branch" ] \
+	&& echo "cannot resolve $remote's HEAD" \
+	&& exit 1
+
+revs=$(git rev-list "refs/remotes/$remote/$branch")
+n=$(echo "$revs" | wc -l | tr -d ' ')
+current=$(git rev-parse HEAD)
+
+offset=0
+while :; do
+	start=$((offset + 1))
+	end=$((offset + page))
+	[ "$end" -gt "$n" ] && end=$n
+	echo "revisions ($remote HEAD -> $branch, newest first):"
+	i=0
+	for rev in $(echo "$revs" | sed -n "${start},${end}p"); do
+		i=$((i + 1))
+		if [ "$rev" = "$current" ]; then
+			marker='>'
+		else
+			marker=' '
+		fi
+		printf '%s%3d. %s\n' "$marker" "$i" \
+			"$(git show -s --format='%h %s' "$rev")"
+	done
+	next=0
+	prev=0
+	if [ "$end" -lt "$n" ]; then
+		i=$((i + 1))
+		next=$i
+		printf '%3d. next...\n' "$i"
+	fi
+	if [ "$offset" -gt 0 ]; then
+		i=$((i + 1))
+		prev=$i
+		printf '%3d. prev...\n' "$i"
+	fi
+	while :; do
+		printf '> '
+		if ! read -r ans; then
+			echo
+			exit 0
+		fi
+		[ -z "$ans" ] && exit 0
+		case $ans in
+		*[!0-9]*) ;;
+		*)
+			if [ "$ans" -ge 1 ] && [ "$ans" -le "$i" ]; then
+				break
+			fi
+			;;
+		esac
+		echo "  pick 1-$i, or blank to go back"
+	done
+	if [ "$ans" -eq "$next" ]; then
+		offset=$((offset + page))
+	elif [ "$ans" -eq "$prev" ]; then
+		offset=$((offset - page))
+	else
+		break
+	fi
+done
+
+sha=$(echo "$revs" | sed -n "$((offset + ans))p")
+[ "$sha" = "$current" ] \
+	&& echo "already on $(git show -s --format=%h "$sha")" \
+	&& exit 0
+git checkout --detach "$sha"
