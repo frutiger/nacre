@@ -9,7 +9,8 @@ Everything is menu-driven — pick from a numbered list; a blank line (or Ctrl-C
 steps back out.
 
 - **`help`** — list the commands
-- **`create <name>`** — create a bare repo `<name>.git`
+- **`create <name>`** — create a bare repo `<name>.git`, asking for the
+  default branch name (`main` if left blank)
 - **`list`** — list the repositories
 - **`work` / `work <repo>`** — browse repositories (each tagged
   `running/total`) and their projects, or jump straight into one repository

@@ -13,4 +13,14 @@ set -euo pipefail
 [ -e "$1.git" ] \
 	&& echo "$1 already exists" \
 	&& exit 1
-git init --bare -b main "$1.git"
+printf "default branch [main]: "
+if ! read -r branch; then
+	exit 1
+fi
+if [ -z "$branch" ]; then
+	branch=main
+fi
+if ! git check-ref-format --branch "$branch" >/dev/null; then
+	exit 1
+fi
+git init --bare -b "$branch" "$1.git"
