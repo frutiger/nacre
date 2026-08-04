@@ -14,8 +14,6 @@ steps back out.
 - **`list`** — list the repositories
 - **`work` / `work <repo>`** — browse repositories (each tagged
   `running/total`) and their projects, or jump straight into one repository
-- **`sync` / `sync <repo>`** — land a project's committed work into its
-  repository, then erase the project
 
 ### Project actions (under `work`)
 
@@ -34,6 +32,8 @@ shown:
 - **stop** *(running)* — stop the session and its proxy.
 - **erase** *(stopped)* — delete the checkout and its metadata. Confirms first
   if that would lose uncommitted changes or commits held nowhere else.
+- **sync** — land the project's committed work into its repository, then stop
+  the session (if running) and erase the project. See below.
 - **edit hosts** — edit `.hosts` in `$EDITOR`; the draft is validated before it
   replaces the policy, so an invalid file never lands.
 - **show hosts** / **show log** — print the policy (plus any undecided `? host`
@@ -44,8 +44,9 @@ shown:
 An agent can't push from inside the sandbox, so integration happens from the
 outside: the canonical repo fetches the checkout's `HEAD` and fast-forwards its
 own `HEAD` (whatever the default branch is — never named or assumed). It
-refuses anything but a strict fast-forward, and refuses a dirty tree. On
-success it stops the session and erases the project.
+refuses anything but a strict fast-forward, and refuses a dirty tree — a
+refusal returns to the menu with the session untouched. On success it stops
+the session and erases the project.
 
 ## Layout
 

@@ -43,7 +43,8 @@ work          browse repositories and their projects
 work <repo>   work on the projects under one repository
 
 Everything is menu-driven: pick a repository, then a project (or "new"),
-then an action (watch, resume, stop, erase, edit hosts, show hosts, log).
+then an action (watch, resume, stop, sync, erase, edit hosts, show hosts,
+log).
 """
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
@@ -540,6 +541,114 @@ def cmd_erase(p: Project) -> None:
     print(f"erased {p.name}")
 
 
+def git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args], capture_output=True, text=True,
+    )
+
+
+def stop_and_wait(p: Project) -> None:
+    """Stop the session and wait for the sandbox to actually exit, so the
+    worktree is nobody's before we rewrite its history."""
+    pid = read_pid(p.pid)
+    stop_session(p)
+    if pid is None:
+        return
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)  # still alive?
+        except OSError:
+            return
+        time.sleep(0.1)
+
+
+def cmd_sync(p: Project) -> None:
+    """Land the checkout's committed work into the canonical repo, then stop
+    the session and erase the project, since its work now lives in the
+    repository.
+
+    An agent can't push from inside the sandbox — the canonical repo is
+    read-only there — so integration happens out here: the canonical repo
+    fetches the checkout's HEAD and fast-forwards its own HEAD to it (never
+    a rebase, and only when the checkout is strictly ahead). A refusal
+    returns to the menu with the session untouched."""
+    wt = p.worktree
+    canon = p.gitdir
+
+    status = git(wt, "status", "--porcelain")
+    if status.returncode != 0:
+        print(f"{p.name}: not a git checkout ({wt})")
+        return
+    if git(wt, "rev-parse", "-q", "--verify", "HEAD").returncode != 0:
+        print(f"{p.name} has no commits yet; nothing to sync")
+        return
+    # committed work only: refuse a dirty tree rather than discard the
+    # agent's uncommitted changes. Checked before stopping, so a refusal
+    # leaves the session untouched.
+    if status.stdout.strip():
+        print(f"{p.name} has uncommitted changes; commit or discard them in "
+              f"the session first (nothing synced)")
+        return
+
+    # Pull the checkout's tip into the canonical repo (the sandbox can't push
+    # out, so integration fetches from the checkout). Reads committed history
+    # only, so it is safe while the session still runs. Everything is done
+    # against the repo's HEAD — a symbolic ref to its default branch — so the
+    # branch is never named or assumed.
+    if (r := git(canon, "fetch", str(wt), "HEAD")).returncode != 0:
+        sys.stderr.write(r.stdout + r.stderr)
+        print(f"{p.name}: could not fetch from the checkout")
+        return
+    src = git(canon, "rev-parse", "FETCH_HEAD").stdout.strip()
+    tip = git(canon, "rev-parse", "-q", "--verify", "HEAD").stdout.strip()
+
+    if tip == src:
+        n = "0"
+    elif tip:
+        # refuse anything but a pure fast-forward: the checkout must be
+        # strictly ahead of the repo's HEAD, never diverged from it
+        if git(canon, "merge-base", "--is-ancestor", tip, src).returncode != 0:
+            print(f"{p.name} has diverged from {p.repo}.git (it moved on "
+                  f"independently); refusing — not a fast-forward")
+            return
+        n = git(canon, "rev-list", "--count", f"{tip}..{src}").stdout.strip()
+    else:
+        n = git(canon, "rev-list", "--count", src).stdout.strip()
+
+    running = alive(p)
+    verb = "stop and erase" if running else "erase"
+    ans = input(f"sync {p.name} into {p.repo}.git, then {verb} the project? "
+                f"[y/N] ").strip()
+    if not ans.lower().startswith("y"):
+        print("not synced")
+        return
+    if running:
+        stop_and_wait(p)
+
+    if n != "0":
+        # advance HEAD's branch to the checkout's tip. The old value is passed
+        # so a branch that moved since the fast-forward check fails the update
+        # rather than being clobbered; update-ref dereferences HEAD for us.
+        args = ["update-ref", "HEAD", src] + ([tip] if tip else [])
+        if (u := git(canon, *args)).returncode != 0:
+            sys.stderr.write(u.stdout + u.stderr)
+            print(f"{p.name}: could not advance {p.repo}.git (did it move "
+                  f"again?). Nothing erased; sync again to retry.")
+            return
+
+    if n == "0":
+        print(f"{p.name}: already current with {p.repo}.git")
+    else:
+        print(f"synced {n} commit(s) from {p.name} into {p.repo}.git")
+    # refresh the checkout's remote-tracking refs so its landed work is now
+    # visibly in the repo; erase's `HEAD --not --remotes` guard then passes
+    # cleanly and it erases without a prompt (but still backstops us if, for
+    # any reason, something here lived only in the checkout).
+    git(wt, "fetch", "origin")
+    cmd_erase(p)
+
+
 def cmd_hosts(p: Project) -> None:
     if p.hosts.exists():
         sys.stdout.write(p.hosts.read_text())
@@ -651,7 +760,7 @@ def project_label(p: Project) -> str:
 
 def choose_repo(header: str) -> str | None:
     """Pick a repository from the menu; None if there are none or the user
-    backs out. Shared by `work` and `sync`."""
+    backs out."""
     repos = list_repos()
     if not repos:
         print("no repositories yet (create one with: create <name>)")
@@ -735,6 +844,9 @@ def project_menu(p: Project) -> None:
         else:
             actions.append(("resume", lambda: resume(p)))
             actions.append(("erase", lambda: cmd_erase(p)))
+        # valid in either state: sync stops a running session itself (after
+        # confirming), and refusals leave it untouched
+        actions.append(("sync", lambda: cmd_sync(p)))
         actions.append(("edit hosts", lambda: cmd_edit(p)))
         actions.append(("show hosts", lambda: cmd_hosts(p)))
         actions.append(("show log", lambda: cmd_log(p)))
@@ -743,7 +855,8 @@ def project_menu(p: Project) -> None:
         if i is None:
             return
         actions[i][1]()
-        # erase removes the project directory; nothing left to manage
+        # erase (alone or via sync) removes the project directory; nothing
+        # left to manage
         if not p.dir.is_dir():
             return
 
