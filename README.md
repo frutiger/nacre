@@ -32,8 +32,9 @@ shown:
   watch. The type (`claude`, the only one today) is fixed for the project's
   life.
 - **watch** *(running)* — decide each host queued in `.pending/`: **a**llow,
-  **d**eny, **w**ildcard (allow `*.parent`), or **s**kip. Ctrl-C returns to the
-  menu; the session keeps running.
+  **d**eny, **w**ildcard (allow `*.parent`), **u**ser-allow (allow for every
+  project, in the user-wide file), or **s**kip. Ctrl-C returns to the menu;
+  the session keeps running.
 - **resume** *(stopped)* — restart the session, then watch.
 - **stop** *(running)* — stop the session and its proxy.
 - **erase** *(stopped)* — delete the checkout and its metadata. Confirms first
@@ -108,8 +109,9 @@ Besides each project's `.hosts` there is an optional user-wide policy at
 entry) that applies to every project. The project file takes precedence: the
 user file is consulted only for hosts the project's policy does not mention at
 all, so a project `+ host` overrides a user-wide `- host` and vice versa.
-Hosts decided in neither file are parked as usual, and decisions made in
-**watch** always land in the project's file.
+Hosts decided in neither file are parked as usual; decisions made in
+**watch** land in the project's file, except **u**ser-allow, which lands in
+the user-wide one.
 
 A request to an undecided host is **parked**: the proxy holds it open and
 queues the host in `.pending/`. Deciding (via **watch** or **edit hosts**)

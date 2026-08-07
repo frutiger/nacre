@@ -266,36 +266,44 @@ def alive(p: Project) -> bool:
     return True
 
 
-def write_policy(p: Project, mutate: Callable[[list[Entry]], list[Entry]]) -> None:
-    """Locked read-modify-write of .hosts, rewritten in canonical order
-    (denies first). Refuses if the current file is malformed: programmatic
-    writes never paper over a broken policy."""
-    lock = p.dir / "hosts.lock"
+def write_policy(
+    hosts: Path,
+    mutate: Callable[[list[Entry]], list[Entry]],
+    hint: str = "the project's 'edit hosts' action",
+) -> None:
+    """Locked read-modify-write of a policy file, rewritten in canonical
+    order (denies first). Refuses if the current file is malformed:
+    programmatic writes never paper over a broken policy."""
+    hosts.parent.mkdir(parents=True, exist_ok=True)
+    lock = hosts.with_name(hosts.name + ".lock")
     with open(lock, "w") as lockf:
         fcntl.flock(lockf, fcntl.LOCK_EX)
-        p.policy().validate("policy update")
-        entries = mutate(p.policy().read())
+        Policy(hosts).validate("policy update", hint)
+        entries = mutate(Policy(hosts).read())
         ordered = [e for e in entries if not e.allow] + [e for e in entries if e.allow]
         text = "".join(e.line() + "\n" for e in ordered)
         # never let a programmatic write leave a policy the parser would reject:
-        # a malformed .hosts fails validation and blocks the next session start
+        # a malformed file fails validation and blocks the next session start
         _entries, errors = parse_policy(text)
         if errors:
             die(f"policy update: refusing to write a malformed policy ({errors[0]})")
-        tmp = p.dir / "hosts.tmp"
+        tmp = hosts.with_name(hosts.name + ".tmp")
         tmp.write_text(text)
         # atomic replace: the proxy always reads a complete file
-        os.replace(tmp, p.hosts)
+        os.replace(tmp, hosts)
 
 
-def set_policy(p: Project, allow: bool, pattern: str) -> None:
+def set_policy(p: Project, allow: bool, pattern: str, user: bool = False) -> None:
     def mutate(entries: list[Entry]) -> list[Entry]:
         kept = [e for e in entries if e.pattern != pattern]
         return kept + [Entry(allow, pattern)]
 
-    # policy first, pending second: .hosts is the source of truth, and a
-    # crash between the two only leaves a stale hint that watch reconciles
-    write_policy(p, mutate)
+    # policy first, pending second: the hosts file is the source of truth, and
+    # a crash between the two only leaves a stale hint that watch reconciles
+    if user:
+        write_policy(USER_HOSTS, mutate, USER_HOSTS_HINT)
+    else:
+        write_policy(p.hosts, mutate)
     (p.pending / pattern).unlink(missing_ok=True)
 
 
@@ -493,10 +501,16 @@ def cmd_watch(p: Project) -> None:
                     resource = ""
                 info = f"  {resource}" if resource else ""
                 ans = input(f"? {host}{info}\n"
-                            f"  [a]llow [d]eny [w]ildcard [s]kip: ").strip()
+                            f"  [a]llow [d]eny [w]ildcard [u]ser-allow "
+                            f"[s]kip: ").strip()
                 if ans.startswith("a"):
                     set_policy(p, True, host)
                     print(f"+ {host}")
+                elif ans.startswith("u"):
+                    # allow in the user-wide file: every project gets it,
+                    # unless its own policy says otherwise
+                    set_policy(p, True, host, user=True)
+                    print(f"+ {host} (user-wide)")
                 elif ans.startswith("d"):
                     set_policy(p, False, host)
                     print(f"- {host}")
