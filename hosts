@@ -1,0 +1,5 @@
+#!/bin/sh
+set -euo pipefail
+
+# the policy code lives in work; _hosts is its hidden verb for this menu
+exec "$(dirname "$0")/work" _hosts

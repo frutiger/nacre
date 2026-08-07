@@ -6,4 +6,5 @@ echo "help             show this help"
 echo "create <name>    create a repository"
 echo "list             list all repositories"
 echo "work             work on a repository's projects"
+echo "hosts            edit or show the user-wide host policy"
 

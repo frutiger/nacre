@@ -17,9 +17,9 @@ steps back out.
   default branch name (`main` if left blank)
 - **`list`** — list the repositories
 - **`work` / `work <repo>`** — browse repositories (each tagged
-  `running/total`) and their projects, or jump straight into one repository.
-  The top-level menu also offers **user hosts**: edit or show the user-wide
-  host policy applied to every project (see Host policy)
+  `running/total`) and their projects, or jump straight into one repository
+- **`hosts`** — edit or show the user-wide host policy layered under every
+  project's own (see Host policy)
 
 ### Project actions (under `work`)
 
@@ -105,8 +105,8 @@ Deny wins, and deny lines must come first so the file reads in precedence
 order. Malformed files are refused, never silently fixed.
 
 Besides each project's `.hosts` there is an optional user-wide policy at
-`~/nacre/hosts` (same format, edited from `work`'s top-level **user hosts**
-entry) that applies to every project. The project file takes precedence: the
+`~/nacre/hosts` (same format, edited or shown with the `hosts` command) that
+applies to every project. The project file takes precedence: the
 user file is consulted only for hosts the project's policy does not mention at
 all, so a project `+ host` overrides a user-wide `- host` and vice versa.
 Hosts decided in neither file are parked as usual; decisions made in

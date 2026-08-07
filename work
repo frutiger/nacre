@@ -21,7 +21,9 @@ is a socat bridge to the proxy socket, and the proxy enforces .hosts.
 .hosts is the source of truth; .pending/ is only a hint queue.
 
 The proxy is this same file, re-invoked with the hidden _serve verb: a
-separate script would show up as a git-shell command of its own.
+separate script would show up as a git-shell command of its own. The hosts
+command *is* such a command, but only a thin exec of the hidden _hosts verb
+here, where the policy code lives.
 """
 
 import asyncio
@@ -48,8 +50,7 @@ work <repo>   work on the projects under one repository
 
 Everything is menu-driven: pick a repository, then a project (or "new"),
 then an action (watch, resume, stop, sync, erase, edit hosts, show hosts,
-log). The top level also offers "user hosts": a policy applied to every
-project, with the project's own hosts taking precedence.
+log). The user-wide host policy has its own command: hosts.
 """
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
@@ -63,7 +64,7 @@ HTTP_PORTS = frozenset({80})       # forwarded plain-HTTP requests
 POLICY_POLL_S = 0.25
 PARK_TIMEOUT_S = 300           # parked connections give up (403) after this
 USER_HOSTS = Path.home() / "nacre" / "hosts"
-USER_HOSTS_HINT = "'user hosts' in the top-level work menu"
+USER_HOSTS_HINT = "the hosts command"
 
 
 def die(msg: str) -> NoReturn:
@@ -825,19 +826,16 @@ def user_hosts_menu() -> None:
 
 
 def repo_picker() -> None:
-    """Top level: the user-wide hosts file, or a repository's menu."""
+    """Top level: pick a repository, then drop into its menu."""
     while True:
         repos = list_repos()
         if not repos:
             print("no repositories yet (create one with: create <name>)")
-        i = choose("repositories:",
-                   ["user hosts", *(repo_label(r) for r in repos)])
+            return
+        i = choose("repositories:", [repo_label(r) for r in repos])
         if i is None:
             return
-        if i == 0:
-            user_hosts_menu()
-        else:
-            repo_menu(repos[i - 1])
+        repo_menu(repos[i])
 
 
 def repo_menu(repo: str) -> None:
@@ -1143,6 +1141,8 @@ def main(argv: list[str]) -> None:
     try:
         if len(argv) == 1:
             repo_picker()
+        elif len(argv) == 2 and argv[1] == "_hosts":
+            user_hosts_menu()
         elif len(argv) == 2:
             repo_menu(check_name(argv[1]))
         else:
