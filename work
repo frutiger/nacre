@@ -23,7 +23,8 @@ is a socat bridge to the proxy socket, and the proxy enforces .hosts.
 The proxy is this same file, re-invoked with the hidden _serve verb: a
 separate script would show up as a git-shell command of its own. The hosts
 command *is* such a command, but only a thin exec of the hidden _hosts verb
-here, where the policy code lives.
+here, where the policy code lives; login (_login) works the same way, since
+the agent-type code lives here.
 """
 
 import asyncio
@@ -50,7 +51,8 @@ work <repo>   work on the projects under one repository
 
 Everything is menu-driven: pick a repository, then a project (or "new"),
 then an action (watch, resume, stop, sync, erase, edit hosts, show hosts,
-log). The user-wide host policy has its own command: hosts.
+log). The user-wide host policy has its own command: hosts. Expired agent
+credentials are renewed with another: login.
 """
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
@@ -315,12 +317,18 @@ class AgentType:
     seed: tuple[str, ...]          # initial allowed hosts
     state_dirs: tuple[str, ...]    # $HOME-relative dirs bound writable
     state_files: tuple[str, ...]   # $HOME-relative files bound writable
+    auth_hints: tuple[str, ...] = ()   # lowercase log fragments that mean
+                                       # the agent's credentials expired
 
     def command(self, name: str, resume: bool) -> list[str]:
         raise NotImplementedError
 
     def prepare(self, project_dir: Path) -> None:
         """Hook run outside the sandbox before each launch."""
+
+    def login(self) -> None:
+        """Interactive (re-)authentication, run outside any sandbox."""
+        raise NotImplementedError
 
 
 @dataclass(frozen=True)
@@ -330,6 +338,15 @@ class ClaudeAgent(AgentType):
         if resume:
             cmd.append("--continue")
         return cmd + ["--name", name]
+
+    def login(self) -> None:
+        # claude's browserless OAuth flow: it prints a URL to open anywhere
+        # and asks for the code back, so it works over ssh. The credential
+        # lands under ~/.claude, which every session binds.
+        exe = shutil.which("claude")
+        if exe is None:
+            die("claude not found on PATH")
+        subprocess.run([exe, "setup-token"], check=False)
 
     def prepare(self, project_dir: Path) -> None:
         # claude refuses to launch headless in an untrusted workspace and
@@ -351,6 +368,8 @@ AGENT_TYPES: dict[str, AgentType] = {
         seed=("api.anthropic.com",),
         state_dirs=(".claude",),
         state_files=(".claude.json",),
+        auth_hints=("oauth token", "invalid api key", "run /login",
+                    "authentication_error"),
     ),
 }
 
@@ -445,6 +464,19 @@ def start_session(p: Project, resume: bool) -> None:
     print(f"started {type_name} session {p.name}")
 
 
+def reap_session(p: Project) -> None:
+    """Kill the proxy (if any) and clear the session metadata files, once
+    the session itself is dead or dying."""
+    proxy_pid = read_pid(p.proxy_pid)
+    if proxy_pid is not None:
+        try:
+            os.kill(proxy_pid, 15)
+        except OSError:
+            pass
+    for f in (p.pid, p.proxy_pid, p.sock):
+        f.unlink(missing_ok=True)
+
+
 def stop_session(p: Project) -> None:
     pid = read_pid(p.pid)
     if pid is not None and alive(p):
@@ -457,14 +489,28 @@ def stop_session(p: Project) -> None:
         print(f"stopped {p.name}")
     else:
         print(f"{p.name} was not running")
-    proxy_pid = read_pid(p.proxy_pid)
-    if proxy_pid is not None:
-        try:
-            os.kill(proxy_pid, 15)
-        except OSError:
-            pass
-    for f in (p.pid, p.proxy_pid, p.sock):
-        f.unlink(missing_ok=True)
+    reap_session(p)
+
+
+def session_exited(p: Project) -> None:
+    """The session died out from under us: reap its proxy, show why (the
+    log tail), and point at login when it smells like expired credentials."""
+    print(f"{p.name}: the session has exited")
+    reap_session(p)
+    try:
+        lines = p.log.read_text(errors="replace").splitlines()
+    except OSError:
+        lines = []
+    for line in lines[-10:]:
+        print(f"  {line}")
+    try:
+        agent_type = AGENT_TYPES.get(p.agent.read_text().strip())
+    except OSError:
+        agent_type = None
+    tail = "\n".join(lines[-50:]).lower()
+    if agent_type and any(h in tail for h in agent_type.auth_hints):
+        print("this looks like expired agent credentials; renew them with "
+              "the login command, then resume")
 
 
 # ---------------------------------------------------------------- verbs
@@ -489,6 +535,11 @@ def cmd_watch(p: Project) -> None:
           f"running)")
     try:
         while True:
+            # a session that dies (crash, expired credentials, an outside
+            # stop) would otherwise leave watch polling forever in silence
+            if not alive(p):
+                session_exited(p)
+                return
             for f in sorted(p.pending.iterdir()):
                 host = f.name
                 # already decided (via edit, the user-wide file, or a crash
@@ -697,6 +748,21 @@ def cmd_sync(p: Project) -> None:
     # any reason, something here lived only in the checkout).
     git(wt, "fetch", "origin")
     cmd_erase(p)
+
+
+def cmd_login() -> None:
+    """Re-run an agent type's login flow, outside any sandbox. Credentials
+    are shared by every project of that type: running sessions pick the new
+    ones up, exited ones need resume."""
+    types = sorted(AGENT_TYPES)
+    if len(types) == 1:
+        type_name = types[0]
+    else:
+        i = choose("agent type:", types)
+        if i is None:
+            return
+        type_name = types[i]
+    AGENT_TYPES[type_name].login()
 
 
 def cmd_hosts(p: Project) -> None:
@@ -1145,6 +1211,8 @@ def main(argv: list[str]) -> None:
             repo_picker()
         elif len(argv) == 2 and argv[1] == "_hosts":
             user_hosts_menu()
+        elif len(argv) == 2 and argv[1] == "_login":
+            cmd_login()
         elif len(argv) == 2:
             repo_menu(check_name(argv[1]))
         else:

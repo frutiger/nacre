@@ -7,4 +7,5 @@ echo "create <name>    create a repository"
 echo "list             list all repositories"
 echo "work             work on a repository's projects"
 echo "hosts            edit or show the user-wide host policy"
+echo "login            renew an agent type's credentials"
 

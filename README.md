@@ -20,6 +20,9 @@ steps back out.
   `running/total`) and their projects, or jump straight into one repository
 - **`hosts`** — edit or show the user-wide host policy layered under every
   project's own (see Host policy)
+- **`login`** — renew an agent type's credentials by re-running its login
+  flow outside any sandbox. Running sessions pick the new credentials up;
+  exited ones need **resume**
 
 ### Project actions (under `work`)
 
@@ -34,7 +37,10 @@ shown:
 - **watch** *(running)* — decide each host queued in `.pending/`: **a**llow,
   **d**eny, **w**ildcard (allow `*.parent`), or **s**kip; a `u` prefix (`ua`,
   `ud`, `uw`) writes the decision to the user-wide file instead. Ctrl-C
-  returns to the menu; the session keeps running.
+  returns to the menu; the session keeps running. If the session dies instead
+  (a crash, or expired credentials), watch reports it with the last log
+  lines — pointing at `login` when it looks like an auth failure — and
+  returns to the menu.
 - **resume** *(stopped)* — restart the session, then watch.
 - **stop** *(running)* — stop the session and its proxy.
 - **erase** *(stopped)* — delete the checkout and its metadata. Confirms first
@@ -128,4 +134,6 @@ npm install -g @anthropic-ai/claude-code
 
 Install these scripts in the git user's `~/git-shell-commands/`, executable,
 with `git-shell` as the login shell. The git user needs Claude Code credentials
-(`ANTHROPIC_API_KEY` or a stored `claude setup-token`).
+(`ANTHROPIC_API_KEY` or a stored `claude setup-token`). Stored credentials
+expire eventually: **watch** reports the dead session when they do, and the
+`login` command renews them.
