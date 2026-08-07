@@ -12,6 +12,10 @@ Layout, per project (one directory under the repo's nacre/):
     ~/<repo>.git/nacre/<proj>/proxy.pid  proxy pid
     ~/<repo>.git/nacre/<proj>/sock       proxy unix socket
 
+plus one user-wide file, layered under every project's policy:
+    ~/nacre/hosts                        host policy for all projects; a
+                                         project's own hosts take precedence
+
 The session runs inside bwrap with no network namespace; the only route out
 is a socat bridge to the proxy socket, and the proxy enforces .hosts.
 .hosts is the source of truth; .pending/ is only a hint queue.
@@ -44,7 +48,8 @@ work <repo>   work on the projects under one repository
 
 Everything is menu-driven: pick a repository, then a project (or "new"),
 then an action (watch, resume, stop, sync, erase, edit hosts, show hosts,
-log).
+log). The top level also offers "user hosts": a policy applied to every
+project, with the project's own hosts taking precedence.
 """
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
@@ -57,6 +62,8 @@ ALLOWED_PORTS = frozenset({443})   # CONNECT tunnels
 HTTP_PORTS = frozenset({80})       # forwarded plain-HTTP requests
 POLICY_POLL_S = 0.25
 PARK_TIMEOUT_S = 300           # parked connections give up (403) after this
+USER_HOSTS = Path.home() / "nacre" / "hosts"
+USER_HOSTS_HINT = "'user hosts' in the top-level work menu"
 
 
 def die(msg: str) -> NoReturn:
@@ -145,7 +152,8 @@ class Policy:
         entries, _errors = parse_policy(text)
         return entries
 
-    def validate(self, context: str) -> None:
+    def validate(self, context: str,
+                 hint: str = "the project's 'edit hosts' action") -> None:
         """Refuse (exit) if the policy file is malformed; a missing file
         is fine (an empty policy just parks everything)."""
         try:
@@ -157,10 +165,27 @@ class Policy:
             for e in errors:
                 print(f"{self.path.name}: {e}", file=sys.stderr)
             die(f"{context}: refusing to continue with a malformed host "
-                f"policy (fix it with the project's 'edit hosts' action)")
+                f"policy (fix it with {hint})")
 
     def decide(self, host: str) -> str:
         return decide(self.read(), host)
+
+
+@dataclass(frozen=True)
+class LayeredPolicy:
+    """A project's policy over the user-wide one: the project file is
+    consulted first, and only a host it does not mention at all falls
+    through to the user file — so a project line (allow or deny) always
+    beats a user-wide one. Both files are re-read on every use."""
+
+    project: Policy
+    user: Policy
+
+    def decide(self, host: str) -> str:
+        verdict = self.project.decide(host)
+        if verdict == "unknown":
+            verdict = self.user.decide(host)
+        return verdict
 
 
 # ---------------------------------------------------------------- project
@@ -217,6 +242,10 @@ class Project:
 
     def policy(self) -> Policy:
         return Policy(self.hosts)
+
+    def effective(self) -> LayeredPolicy:
+        """The policy the proxy enforces: project hosts over user hosts."""
+        return LayeredPolicy(self.policy(), Policy(USER_HOSTS))
 
 
 def read_pid(path: Path) -> int | None:
@@ -325,6 +354,7 @@ def start_session(p: Project, resume: bool) -> None:
         return
     # validate only: refuses to launch on a malformed policy file
     p.policy().validate("session start")
+    Policy(USER_HOSTS).validate("session start", USER_HOSTS_HINT)
     type_name = p.agent.read_text().strip()
     agent_type = AGENT_TYPES.get(type_name)
     if agent_type is None:
@@ -344,7 +374,8 @@ def start_session(p: Project, resume: bool) -> None:
     log = open(p.log, "ab")
     self_path = os.path.abspath(__file__)
     proxy = subprocess.Popen(
-        [self_path, "_serve", str(p.sock), str(p.hosts), str(p.pending)],
+        [self_path, "_serve", str(p.sock), str(p.hosts), str(USER_HOSTS),
+         str(p.pending)],
         stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
         start_new_session=True,
     )
@@ -443,6 +474,7 @@ def wildcard_of(host: str) -> str:
 def cmd_watch(p: Project) -> None:
     # validate only: no point watching on behalf of a broken policy
     p.policy().validate("watch")
+    Policy(USER_HOSTS).validate("watch", USER_HOSTS_HINT)
     p.pending.mkdir(exist_ok=True)
     print(f"watching {p.name} (ctrl-c returns to the menu; the session keeps "
           f"running)")
@@ -450,9 +482,9 @@ def cmd_watch(p: Project) -> None:
         while True:
             for f in sorted(p.pending.iterdir()):
                 host = f.name
-                # already decided (via edit, or a crash between policy
-                # write and pending unlink): just clear the hint
-                if p.policy().decide(host) != "unknown":
+                # already decided (via edit, the user-wide file, or a crash
+                # between policy write and pending unlink): clear the hint
+                if p.effective().decide(host) != "unknown":
                     f.unlink(missing_ok=True)
                     continue
                 try:
@@ -484,13 +516,14 @@ def cmd_watch(p: Project) -> None:
         print(f"\ndetached from {p.name}")
 
 
-def cmd_edit(p: Project) -> None:
-    """Transactional $EDITOR on the policy: the draft only replaces .hosts
+def edit_hosts(hosts: Path) -> None:
+    """Transactional $EDITOR on a policy file: the draft only replaces it
     once it validates, so an invalid policy never lands on disk."""
     editor = shlex.split(os.environ.get("EDITOR", "vi"))
-    draft = p.dir / "hosts.edit"
-    if p.hosts.exists():
-        shutil.copy(p.hosts, draft)
+    hosts.parent.mkdir(parents=True, exist_ok=True)
+    draft = hosts.with_name(hosts.name + ".edit")
+    if hosts.exists():
+        shutil.copy(hosts, draft)
     else:
         draft.write_text("")
     try:
@@ -507,7 +540,7 @@ def cmd_edit(p: Project) -> None:
                 return
         # validated draft installed as-is: comments and (checked) order
         # are the user's
-        os.replace(draft, p.hosts)
+        os.replace(draft, hosts)
     finally:
         draft.unlink(missing_ok=True)
 
@@ -652,7 +685,11 @@ def cmd_sync(p: Project) -> None:
 def cmd_hosts(p: Project) -> None:
     if p.hosts.exists():
         sys.stdout.write(p.hosts.read_text())
-    policy = p.policy()
+    if USER_HOSTS.exists():
+        print("# user hosts (consulted only where the project's lines above "
+              "are silent):")
+        sys.stdout.write(USER_HOSTS.read_text())
+    policy = p.effective()
     if p.pending.is_dir():
         for f in sorted(p.pending.iterdir()):
             if policy.decide(f.name) == "unknown":
@@ -758,24 +795,35 @@ def project_label(p: Project) -> str:
     return f"{p.proj}  ({'running' if alive(p) else 'stopped'})"
 
 
-def choose_repo(header: str) -> str | None:
-    """Pick a repository from the menu; None if there are none or the user
-    backs out."""
-    repos = list_repos()
-    if not repos:
-        print("no repositories yet (create one with: create <name>)")
-        return None
-    i = choose(header, [repo_label(r) for r in repos])
-    return repos[i] if i is not None else None
+def user_hosts_menu() -> None:
+    """The user-wide policy, layered under every project's own hosts."""
+    while True:
+        i = choose("user hosts (applied to every project; a project's own "
+                   "hosts take precedence):", ["edit", "show"])
+        if i is None:
+            return
+        if i == 0:
+            edit_hosts(USER_HOSTS)
+        elif USER_HOSTS.exists():
+            sys.stdout.write(USER_HOSTS.read_text())
+        else:
+            print(f"no user hosts yet ({USER_HOSTS})")
 
 
 def repo_picker() -> None:
-    """Top level: pick a repository, then drop into its menu."""
+    """Top level: the user-wide hosts file, or a repository's menu."""
     while True:
-        repo = choose_repo("repositories:")
-        if repo is None:
+        repos = list_repos()
+        if not repos:
+            print("no repositories yet (create one with: create <name>)")
+        i = choose("repositories:",
+                   ["user hosts", *(repo_label(r) for r in repos)])
+        if i is None:
             return
-        repo_menu(repo)
+        if i == 0:
+            user_hosts_menu()
+        else:
+            repo_menu(repos[i - 1])
 
 
 def repo_menu(repo: str) -> None:
@@ -847,7 +895,7 @@ def project_menu(p: Project) -> None:
         # valid in either state: sync stops a running session itself (after
         # confirming), and refusals leave it untouched
         actions.append(("sync", lambda: cmd_sync(p)))
-        actions.append(("edit hosts", lambda: cmd_edit(p)))
+        actions.append(("edit hosts", lambda: edit_hosts(p.hosts)))
         actions.append(("show hosts", lambda: cmd_hosts(p)))
         actions.append(("show log", lambda: cmd_log(p)))
         i = choose(f"{p.name}  ({'running' if running else 'stopped'}):",
@@ -895,7 +943,7 @@ async def relay(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> N
 
 
 async def serve_client(
-    policy: Policy,
+    policy: LayeredPolicy,
     pending: Path,
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -1009,8 +1057,10 @@ async def serve_client(
     writer.close()
 
 
-async def run_proxy(sock: Path, hosts: Path, pending: Path) -> None:
-    policy = Policy(hosts)
+async def run_proxy(
+    sock: Path, hosts: Path, user_hosts: Path, pending: Path,
+) -> None:
+    policy = LayeredPolicy(Policy(hosts), Policy(user_hosts))
 
     async def handler(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         try:
@@ -1071,8 +1121,9 @@ def restore_terminal(state: tuple[int, int] | None) -> None:
 
 
 def main(argv: list[str]) -> None:
-    if len(argv) == 5 and argv[1] == "_serve":
-        asyncio.run(run_proxy(Path(argv[2]), Path(argv[3]), Path(argv[4])))
+    if len(argv) == 6 and argv[1] == "_serve":
+        asyncio.run(run_proxy(Path(argv[2]), Path(argv[3]), Path(argv[4]),
+                              Path(argv[5])))
         return
     term = grab_terminal()
     try:
