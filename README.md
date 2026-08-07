@@ -67,7 +67,7 @@ git directory; its projects are checkouts nested inside it:
 ~/<repo>.git/nacre/<proj>/hosts      host policy
 ~/<repo>.git/nacre/<proj>/pending/   hosts awaiting an allow/deny decision
 ~/<repo>.git/nacre/<proj>/log        session + proxy log
-~/nacre/hosts                        user-wide host policy (optional)
+~/.nacre/hosts                       user-wide host policy (optional)
 ```
 
 Only `worktree` is writable inside the sandbox. Project names are unique only
@@ -105,7 +105,7 @@ Deny wins, and deny lines must come first so the file reads in precedence
 order. Malformed files are refused, never silently fixed.
 
 Besides each project's `.hosts` there is an optional user-wide policy at
-`~/nacre/hosts` (same format, edited or shown with the `hosts` command) that
+`~/.nacre/hosts` (same format, edited or shown with the `hosts` command) that
 applies to every project. The project file takes precedence: the
 user file is consulted only for hosts the project's policy does not mention at
 all, so a project `+ host` overrides a user-wide `- host` and vice versa.

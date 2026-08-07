@@ -13,7 +13,7 @@ Layout, per project (one directory under the repo's nacre/):
     ~/<repo>.git/nacre/<proj>/sock       proxy unix socket
 
 plus one user-wide file, layered under every project's policy:
-    ~/nacre/hosts                        host policy for all projects; a
+    ~/.nacre/hosts                       host policy for all projects; a
                                          project's own hosts take precedence
 
 The session runs inside bwrap with no network namespace; the only route out
@@ -63,7 +63,7 @@ ALLOWED_PORTS = frozenset({443})   # CONNECT tunnels
 HTTP_PORTS = frozenset({80})       # forwarded plain-HTTP requests
 POLICY_POLL_S = 0.25
 PARK_TIMEOUT_S = 300           # parked connections give up (403) after this
-USER_HOSTS = Path.home() / "nacre" / "hosts"
+USER_HOSTS = Path.home() / ".nacre" / "hosts"
 USER_HOSTS_HINT = "the hosts command"
 
 
