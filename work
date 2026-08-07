@@ -761,7 +761,7 @@ def cmd_new(p: Project, type_name: str) -> None:
 
 def choose(header: str, items: list[str]) -> int | None:
     """Print a numbered menu and return the chosen 0-based index, or None
-    if the user backs out (blank line, ctrl-c, ctrl-d)."""
+    if the user backs out (ctrl-c, ctrl-d)."""
     if not items:
         return None
     print(header)
@@ -774,10 +774,10 @@ def choose(header: str, items: list[str]) -> int | None:
             print()
             return None
         if not ans:
-            return None
+            continue
         if ans.isdigit() and 1 <= int(ans) <= len(items):
             return int(ans) - 1
-        print(f"  pick 1-{len(items)}, or blank to go back")
+        print(f"  pick 1-{len(items)}")
 
 
 def projects_of(repo: str) -> list[Project]:
