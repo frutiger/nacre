@@ -133,7 +133,7 @@ npm install -g @anthropic-ai/claude-code
 ```
 
 Install these scripts in the git user's `~/git-shell-commands/`, executable,
-with `git-shell` as the login shell. The git user needs Claude Code credentials
-(`ANTHROPIC_API_KEY` or a stored `claude setup-token`). Stored credentials
-expire eventually: **watch** reports the dead session when they do, and the
-`login` command renews them.
+with `git-shell` as the login shell. The git user needs Claude Code
+credentials: `ANTHROPIC_API_KEY`, or stored ones from the `login` command.
+Stored credentials expire eventually: **watch** reports the dead session when
+they do, and `login` renews them.
