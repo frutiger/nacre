@@ -703,8 +703,10 @@ def cmd_sync(p: Project) -> None:
     An agent can't push from inside the sandbox — the canonical repo is
     read-only there — so integration happens out here: the canonical repo
     fetches the checkout's HEAD and fast-forwards its own HEAD to it (never
-    a rebase, and only when the checkout is strictly ahead). A refusal
-    returns to the menu with the session untouched."""
+    a rebase, and normally only when the checkout is strictly ahead). If the
+    two have diverged, the graph of both heads is shown and the user may
+    force the update, dropping the repo-only commits. A refusal returns to
+    the menu with the session untouched."""
     wt = p.worktree
     canon = p.gitdir
 
@@ -735,32 +737,51 @@ def cmd_sync(p: Project) -> None:
     src = git(canon, "rev-parse", "FETCH_HEAD").stdout.strip()
     tip = git(canon, "rev-parse", "-q", "--verify", "HEAD").stdout.strip()
 
+    force = False
+    lost = "0"
     if tip == src:
         n = "0"
     elif tip:
-        # refuse anything but a pure fast-forward: the checkout must be
-        # strictly ahead of the repo's HEAD, never diverged from it
+        # a pure fast-forward — the checkout strictly ahead of the repo's
+        # HEAD — needs no consent beyond the sync prompt. A diverged repo
+        # (it moved on independently) is shown as a graph of both heads and
+        # synced only by an explicitly confirmed forced update.
         if git(canon, "merge-base", "--is-ancestor", tip, src).returncode != 0:
+            lost = git(canon, "rev-list", "--count",
+                       f"{src}..{tip}").stdout.strip()
             print(f"{p.name} has diverged from {p.repo}.git (it moved on "
-                  f"independently); refusing — not a fast-forward")
-            return
+                  f"independently); not a fast-forward. Syncing would drop "
+                  f"the {lost} commit(s) only in {p.repo}.git:")
+            print(f"  {git(canon, 'rev-parse', '--short', src).stdout.strip()}"
+                  f" = {p.name}")
+            print(f"  {git(canon, 'rev-parse', '--short', tip).stdout.strip()}"
+                  f" = {p.repo}.git")
+            # show just the diverged parts, down to (and including, via
+            # --boundary) the common ancestor; unrelated histories have no
+            # merge-base, so their graph is shown whole
+            log = ["log", "--oneline", "--graph", src, tip]
+            if mb := git(canon, "merge-base", tip, src).stdout.strip():
+                log += ["--boundary", f"^{mb}"]
+            print(git(canon, *log).stdout, end="")
+            force = True
         n = git(canon, "rev-list", "--count", f"{tip}..{src}").stdout.strip()
     else:
         n = git(canon, "rev-list", "--count", src).stdout.strip()
 
     running = alive(p)
     verb = "stop and erase" if running else "erase"
-    ans = input(f"sync {p.name} into {p.repo}.git, then {verb} the project? "
-                f"[y/N] ").strip()
+    what = (f"force-sync {p.name} into {p.repo}.git, dropping {lost} "
+            f"commit(s)" if force else f"sync {p.name} into {p.repo}.git")
+    ans = input(f"{what}, then {verb} the project? [y/N] ").strip()
     if not ans.lower().startswith("y"):
         print("not synced")
         return
     if running:
         stop_and_wait(p)
 
-    if n != "0":
-        # advance HEAD's branch to the checkout's tip. The old value is passed
-        # so a branch that moved since the fast-forward check fails the update
+    if n != "0" or force:
+        # point HEAD's branch at the checkout's tip. The old value is passed
+        # so a branch that moved since the divergence check fails the update
         # rather than being clobbered; update-ref dereferences HEAD for us.
         args = ["update-ref", "HEAD", src] + ([tip] if tip else [])
         if (u := git(canon, *args)).returncode != 0:
@@ -769,7 +790,10 @@ def cmd_sync(p: Project) -> None:
                   f"again?). Nothing erased; sync again to retry.")
             return
 
-    if n == "0":
+    if force:
+        print(f"force-synced {n} commit(s) from {p.name} into {p.repo}.git, "
+              f"dropping {lost}")
+    elif n == "0":
         print(f"{p.name}: already current with {p.repo}.git")
     else:
         print(f"synced {n} commit(s) from {p.name} into {p.repo}.git")

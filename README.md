@@ -57,10 +57,11 @@ shown:
 
 An agent can't push from inside the sandbox, so integration happens from the
 outside: the canonical repo fetches the checkout's `HEAD` and fast-forwards its
-own `HEAD` (whatever the default branch is — never named or assumed). It
-refuses anything but a strict fast-forward, and refuses a dirty tree — a
-refusal returns to the menu with the session untouched. On success it stops
-the session and erases the project.
+own `HEAD` (whatever the default branch is — never named or assumed). If the
+repository has diverged from the checkout it shows a graph of the two heads
+and offers a forced update that drops the repository-only commits; it refuses
+a dirty tree — a refusal returns to the menu with the session untouched. On
+success it stops the session and erases the project.
 
 ## Layout
 
