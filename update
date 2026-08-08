@@ -31,6 +31,13 @@ while :; do
 	end=$((offset + page))
 	[ "$end" -gt "$n" ] && end=$n
 	echo "revisions ($remote HEAD -> $branch, newest first):"
+	prev=-1
+	lo=1
+	if [ "$offset" -gt 0 ]; then
+		prev=0
+		lo=0
+		printf ' %3d. prev...\n' "$prev"
+	fi
 	i=0
 	for rev in $(echo "$revs" | sed -n "${start},${end}p"); do
 		i=$((i + 1))
@@ -42,17 +49,11 @@ while :; do
 		printf '%s%3d. %s\n' "$marker" "$i" \
 			"$(git show -s --format='%h %s' "$rev")"
 	done
-	next=0
-	prev=0
+	next=-1
 	if [ "$end" -lt "$n" ]; then
 		i=$((i + 1))
 		next=$i
-		printf '%3d. next...\n' "$i"
-	fi
-	if [ "$offset" -gt 0 ]; then
-		i=$((i + 1))
-		prev=$i
-		printf '%3d. prev...\n' "$i"
+		printf ' %3d. next...\n' "$i"
 	fi
 	while :; do
 		printf '> '
@@ -64,12 +65,12 @@ while :; do
 		case $ans in
 		*[!0-9]*) ;;
 		*)
-			if [ "$ans" -ge 1 ] && [ "$ans" -le "$i" ]; then
+			if [ "$ans" -ge "$lo" ] && [ "$ans" -le "$i" ]; then
 				break
 			fi
 			;;
 		esac
-		echo "  pick 1-$i, or blank to go back"
+		echo "  pick $lo-$i, or blank to go back"
 	done
 	if [ "$ans" -eq "$next" ]; then
 		offset=$((offset + page))
