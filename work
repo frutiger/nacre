@@ -526,11 +526,41 @@ def wildcard_of(host: str) -> str:
     return "*." + ".".join(parts[1:]) if len(parts) > 2 else f"*.{host}"
 
 
+# a proxy decision line in the shared log: timestamp, then the verdict.
+# Anchored to the line start so agent output merely mentioning these words
+# is not mistaken for one.
+DECISION_RE = re.compile(r"^\S+ proxy: (?:allow|deny) ")
+
+
+def show_decisions(log: Path, pos: int) -> int:
+    """Print the proxy's allow/deny lines appended to the log since pos;
+    returns the position after the last complete line seen."""
+    try:
+        with open(log, "rb") as f:
+            f.seek(pos)
+            data = f.read()
+    except OSError:
+        return pos
+    end = data.rfind(b"\n")
+    if end < 0:
+        return pos
+    for raw in data[:end].split(b"\n"):
+        line = raw.decode(errors="replace")
+        if DECISION_RE.match(line):
+            print(line)
+    return pos + end + 1
+
+
 def cmd_watch(p: Project) -> None:
     # validate only: no point watching on behalf of a broken policy
     p.policy().validate("watch")
     Policy(USER_HOSTS).validate("watch", USER_HOSTS_HINT)
     p.pending.mkdir(exist_ok=True)
+    # decisions are shown live from here on, not replayed from history
+    try:
+        log_pos = p.log.stat().st_size
+    except OSError:
+        log_pos = 0
     print(f"watching {p.name} (ctrl-c returns to the menu; the session keeps "
           f"running)")
     try:
@@ -540,6 +570,7 @@ def cmd_watch(p: Project) -> None:
             if not alive(p):
                 session_exited(p)
                 return
+            log_pos = show_decisions(p.log, log_pos)
             for f in sorted(p.pending.iterdir()):
                 host = f.name
                 # already decided (via edit, the user-wide file, or a crash
