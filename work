@@ -2,7 +2,7 @@
 """nacre work: sandboxed, network-policed agent sessions inside bare repos.
 
 Layout, per project (one directory under the repo's nacre/):
-    ~/<repo>.git/nacre/<proj>/worktree   working checkout (detached HEAD)
+    ~/<repo>.git/nacre/<proj>/<repo>     working checkout (detached HEAD)
     ~/<repo>.git/nacre/<proj>/hosts      host policy ("- h" / "+ h", denies first)
     ~/<repo>.git/nacre/<proj>/pending/   hosts parked by the proxy, awaiting a
                                          decision (content: requested resource)
@@ -56,6 +56,12 @@ credentials are renewed with another: login.
 """
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
+# everything that lives beside the checkout in a project's directory; a repo
+# named like one of these keeps the legacy "worktree" checkout name
+RESERVED_NAMES = frozenset({
+    "worktree", "hosts", "hosts.lock", "hosts.tmp", "hosts.edit",
+    "pending", "agent", "log", "pid", "proxy.pid", "sock",
+})
 LABEL = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
 PATTERN_RE = re.compile(rf"^(?:\*\.)?{LABEL}(?:\.{LABEL})*$")
 HOST_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
@@ -213,7 +219,14 @@ class Project:
 
     @property
     def worktree(self) -> Path:
-        return self.dir / "worktree"
+        """The checkout, named after the repo: claude.ai/code labels a
+        session with its directory's basename, so a constant name would
+        label every project alike. Projects created before this naming
+        keep their legacy "worktree" checkout."""
+        legacy = self.dir / "worktree"
+        if legacy.is_dir() or self.repo in RESERVED_NAMES:
+            return legacy
+        return self.dir / self.repo
 
     @property
     def hosts(self) -> Path:
@@ -421,7 +434,8 @@ def start_session(p: Project, resume: bool) -> None:
         time.sleep(0.1)
 
     agent_type.prepare(p.worktree)
-    run = agent_type.command(p.name, resume)
+    # the project alone: the repo already shows as the session's directory
+    run = agent_type.command(p.proj, resume)
     # resolve the binary out here: the sandbox inherits a PATH it may not
     # be able to satisfy, and a clear early error beats one in the log
     exe = shutil.which(run[0])

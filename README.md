@@ -70,17 +70,21 @@ git directory; its projects are checkouts nested inside it:
 
 ```
 ~/<repo>.git/                        canonical bare repository
-~/<repo>.git/nacre/<proj>/worktree   project checkout (detached HEAD)
+~/<repo>.git/nacre/<proj>/<repo>     project checkout (detached HEAD)
 ~/<repo>.git/nacre/<proj>/hosts      host policy
 ~/<repo>.git/nacre/<proj>/pending/   hosts awaiting an allow/deny decision
 ~/<repo>.git/nacre/<proj>/log        session + proxy log
 ~/.nacre/hosts                       user-wide host policy (optional)
 ```
 
-Only `worktree` is writable inside the sandbox. Project names are unique only
-within a repository, so the menus are always scoped to one repository.
-Checkouts are cloned `--no-hardlinks`, so a session never shares inodes with
-the canonical object store.
+Only the checkout is writable inside the sandbox. It is named after the repo,
+and the session is named after the project, so claude.ai/code — which labels a
+session with its directory's basename — shows `<repo>` as the grouping and
+`<proj>` as the session. (Projects created before this naming keep a checkout
+named `worktree`.) Project names are unique only within a repository, so the
+menus are always scoped to one repository. Checkouts are cloned
+`--no-hardlinks`, so a session never shares inodes with the canonical object
+store.
 
 ## Sandbox
 
