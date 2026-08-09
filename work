@@ -532,23 +532,56 @@ def wildcard_of(host: str) -> str:
 DECISION_RE = re.compile(r"^\S+ proxy: (?:allow|deny) ")
 
 
-def show_decisions(log: Path, pos: int) -> int:
-    """Print the proxy's allow/deny lines appended to the log since pos;
-    returns the position after the last complete line seen."""
-    try:
-        with open(log, "rb") as f:
-            f.seek(pos)
-            data = f.read()
-    except OSError:
-        return pos
-    end = data.rfind(b"\n")
-    if end < 0:
-        return pos
-    for raw in data[:end].split(b"\n"):
-        line = raw.decode(errors="replace")
-        if DECISION_RE.match(line):
-            print(line)
-    return pos + end + 1
+class DecisionView:
+    """Tails the shared log and shows the proxy's allow/deny lines,
+    starting from the log's current end (live decisions, not history).
+    Repeats of the last decision collapse into a "(xN)" count rewritten
+    in place: the cursor stays parked at the end of the newest decision
+    line, so close() must run before any other output."""
+
+    def __init__(self, log: Path) -> None:
+        self.log = log
+        try:
+            self.pos = log.stat().st_size
+        except OSError:
+            self.pos = 0
+        self.line = ""   # the open decision line (cursor still on it)
+        self.key = ""    # that line minus its timestamp
+        self.count = 0
+
+    def poll(self) -> None:
+        """Show the decision lines appended to the log since last time."""
+        try:
+            with open(self.log, "rb") as f:
+                f.seek(self.pos)
+                data = f.read()
+        except OSError:
+            return
+        end = data.rfind(b"\n")
+        if end < 0:
+            return
+        self.pos += end + 1
+        for raw in data[:end].split(b"\n"):
+            line = raw.decode(errors="replace")
+            if not DECISION_RE.match(line):
+                continue
+            key = line.split(" ", 1)[1]
+            if key == self.key:
+                self.count += 1
+                # rewrite in place, keeping the first occurrence's
+                # timestamp; the line only ever grows, so a bare \r
+                # leaves no remnant to erase
+                print(f"\r{self.line} (x{self.count})", end="", flush=True)
+            else:
+                self.close()
+                self.line, self.key, self.count = line, key, 1
+                print(line, end="", flush=True)
+
+    def close(self) -> None:
+        """Finish the open line so other output starts on a fresh one."""
+        if self.key:
+            print(flush=True)
+            self.key = ""
 
 
 def cmd_watch(p: Project) -> None:
@@ -556,11 +589,7 @@ def cmd_watch(p: Project) -> None:
     p.policy().validate("watch")
     Policy(USER_HOSTS).validate("watch", USER_HOSTS_HINT)
     p.pending.mkdir(exist_ok=True)
-    # decisions are shown live from here on, not replayed from history
-    try:
-        log_pos = p.log.stat().st_size
-    except OSError:
-        log_pos = 0
+    view = DecisionView(p.log)
     print(f"watching {p.name} (ctrl-c returns to the menu; the session keeps "
           f"running)")
     try:
@@ -568,9 +597,10 @@ def cmd_watch(p: Project) -> None:
             # a session that dies (crash, expired credentials, an outside
             # stop) would otherwise leave watch polling forever in silence
             if not alive(p):
+                view.close()
                 session_exited(p)
                 return
-            log_pos = show_decisions(p.log, log_pos)
+            view.poll()
             for f in sorted(p.pending.iterdir()):
                 host = f.name
                 # already decided (via edit, the user-wide file, or a crash
@@ -583,6 +613,7 @@ def cmd_watch(p: Project) -> None:
                 except OSError:
                     resource = ""
                 info = f"  {resource}" if resource else ""
+                view.close()
                 ans = input(f"? {host}{info}\n"
                             f"  [a]llow [d]eny [w]ildcard [s]kip "
                             f"(u* = user-wide): ").strip()
