@@ -1,7 +1,0 @@
-#!/bin/sh
-set -euo pipefail
-
-for path in *.git; do
-	[ -d "$path" ] || continue
-	echo "${path%.git}"
-done

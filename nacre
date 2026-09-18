@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""nacre work: sandboxed, network-policed agent sessions inside bare repos.
+"""nacre: sandboxed, network-policed agent sessions inside bare repos.
 
 Layout, per project (one directory under the repo's nacre/):
     ~/<repo>.git/nacre/<proj>/<repo>     working checkout (detached HEAD)
@@ -20,11 +20,25 @@ The session runs inside bwrap with no network namespace; the only route out
 is a socat bridge to the proxy socket, and the proxy enforces .hosts.
 .hosts is the source of truth; .pending/ is only a hint queue.
 
-The proxy is this same file, re-invoked with the hidden _serve verb: a
-separate script would show up as a git-shell command of its own. The hosts
-command *is* such a command, but only a thin exec of the hidden _hosts verb
-here, where the policy code lives; login (_login) works the same way, since
-the agent-type code lives here.
+Everything is reached one way: git-shell runs help at login, help is a
+three-line exec of this, and this opens a menu. There are no other commands,
+because every one of them would be another name in git-shell-commands/ for
+something the menu already reaches -- and every plain name there is a command
+a user can type, so the set is kept small. The proxy is this same file too,
+re-invoked with the hidden _serve verb, for that reason.
+
+Two files beside this one, for two different reasons:
+
+    menu.py   the numbered lists and prompts, imported from here. A module,
+              not a command: git-shell refuses any name with a dot in it.
+    update    the way back from a revision whose nacre does not run, so it
+              cannot be anything that runs nacre -- or imports menu.py --
+              first. It keeps its own copy of the picker, and the menu
+              shells out to it rather than keeping a second copy here.
+
+The menu needs a terminal. With none (which is not how this host is used,
+but is what a stray `ssh <host> help` would get) it prints the names
+instead of pretending to prompt.
 """
 
 import asyncio
@@ -45,14 +59,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
+from menu import choose, confirm, prompt
+
 USAGE = """\
-work          browse repositories and their projects
-work <repo>   work on the projects under one repository
+nacre          the menu: repositories, hosts, login, update
+nacre <repo>   skip the picker and open one repository
 
 Everything is menu-driven: pick a repository, then a project (or "new"),
 then an action (watch, resume, stop, sync, erase, edit hosts, show hosts,
-log). The user-wide host policy has its own command: hosts. Expired agent
-credentials are renewed with another: login.
+log).
+"""
+
+# what there is to type, for the no-terminal case. Both names are this file:
+# git-shell runs help at login, and help execs nacre.
+COMMANDS = """\
+help             open the menu
+nacre            the same menu
+nacre <repo>     the same menu, opened at one repository
+update           switch these commands to another revision
 """
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
@@ -72,7 +96,7 @@ HTTP_PORTS = frozenset({80})       # forwarded plain-HTTP requests
 POLICY_POLL_S = 0.25
 PARK_TIMEOUT_S = 300           # parked connections give up (403) after this
 USER_HOSTS = Path.home() / ".nacre" / "hosts"
-USER_HOSTS_HINT = "the hosts command"
+USER_HOSTS_HINT = "the menu's user hosts entry"
 
 
 def die(msg: str) -> NoReturn:
@@ -524,7 +548,7 @@ def session_exited(p: Project) -> None:
     tail = "\n".join(lines[-50:]).lower()
     if agent_type and any(h in tail for h in agent_type.auth_hints):
         print("this looks like expired agent credentials; renew them with "
-              "the login command, then resume")
+              "the menu's login entry, then resume")
 
 
 # ---------------------------------------------------------------- verbs
@@ -678,8 +702,8 @@ def edit_hosts(hosts: Path) -> None:
                 break
             for e in errors:
                 print(e, file=sys.stderr)
-            ans = input("[e]dit again or [a]bandon? ").strip()
-            if not ans.startswith("e"):
+            ans = prompt("[e]dit again or [a]bandon? ")
+            if ans is None or not ans.startswith("e"):
                 print("abandoned; policy unchanged")
                 return
         # validated draft installed as-is: comments and (checked) order
@@ -711,7 +735,7 @@ def cmd_erase(p: Project) -> None:
         at_risk.append(f"{len(r.stdout.split())} commit(s) not in {p.repo}.git")
     if at_risk:
         print(f"{p.name} has {' and '.join(at_risk)}")
-        if not input(f"erase {p.name} anyway? [y/N] ").strip().startswith("y"):
+        if not confirm(f"erase {p.name} anyway?"):
             print("not erased")
             return
     shutil.rmtree(p.dir)
@@ -817,8 +841,7 @@ def cmd_sync(p: Project) -> None:
     verb = "stop and erase" if running else "erase"
     what = (f"force-sync {p.name} into {p.repo}.git, dropping {lost} "
             f"commit(s)" if force else f"sync {p.name} into {p.repo}.git")
-    ans = input(f"{what}, then {verb} the project? [y/N] ").strip()
-    if not ans.lower().startswith("y"):
+    if not confirm(f"{what}, then {verb} the project?"):
         print("not synced")
         return
     if running:
@@ -893,7 +916,7 @@ def cmd_new(p: Project, type_name: str) -> None:
         die(f"unknown agent type: {type_name} "
             f"(available: {', '.join(sorted(AGENT_TYPES))})")
     if not p.gitdir.is_dir():
-        die(f"no such repo: {p.repo} (try: create {p.repo})")
+        die(f"no such repo: {p.repo}")
     if p.dir.exists():
         die(f"{p.name} already exists")
     p.pending.mkdir(parents=True, exist_ok=True)
@@ -923,28 +946,64 @@ def cmd_new(p: Project, type_name: str) -> None:
     cmd_watch(p)
 
 
-# ---------------------------------------------------------------- menus
+# ------------------------------------------------------- repository verbs
 
-def choose(header: str, items: list[str]) -> int | None:
-    """Print a numbered menu and return the chosen 0-based index, or None
-    if the user backs out (ctrl-c, ctrl-d)."""
-    if not items:
-        return None
-    print(header)
-    for i, label in enumerate(items, 1):
-        print(f"{i:>3}. {label}")
+def cmd_help() -> None:
+    """A bare invocation, which is what help execs: the menu on a terminal,
+    and with none -- which this host is not used for, but a stray
+    `ssh <host> help` would be -- the names instead of a dead prompt."""
+    if sys.stdin.isatty():
+        main_menu()
+    else:
+        sys.stdout.write(COMMANDS)
+
+
+def cmd_create() -> None:
+    """Create a bare repository, asking for its name and then its default
+    branch (main if left blank). A repository name has no sensible default,
+    so a blank one is just asked for again."""
+    home = Path.home()
     while True:
-        try:
-            ans = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return None
-        if not ans:
-            continue
-        if ans.isdigit() and 1 <= int(ans) <= len(items):
-            return int(ans) - 1
-        print(f"  pick 1-{len(items)}")
+        name = prompt("new repository name: ")
+        if name is None:
+            return
+        if not NAME_RE.match(name):
+            print("  letters, digits, . _ - only; no leading .")
+        elif (home / f"{name}.git").exists():
+            print(f"  {name} already exists")
+        else:
+            break
+    while True:
+        branch = prompt("default branch [main]: ", "main")
+        if branch is None:
+            return
+        if subprocess.run(["git", "check-ref-format", "--branch", branch],
+                          capture_output=True).returncode == 0:
+            break
+        print(f"  bad branch name: {branch}")
+    subprocess.run(
+        ["git", "init", "--bare", "-b", branch, str(home / f"{name}.git")],
+    )
 
+
+def cmd_update() -> None:
+    """Switch these commands to another revision, by running the update
+    script beside us.
+
+    update is the one thing not in this file, and the one menu not drawn by
+    it: if a revision whose nacre does not run ever lands here, the way back
+    cannot be something that has to run nacre first.
+    """
+    script = Path(__file__).resolve().parent / "update"
+    if not script.is_file():
+        print(f"no update script beside {Path(__file__).name}", file=sys.stderr)
+        return
+    subprocess.run([str(script)])
+
+
+# ---------------------------------------------------------------- menus
+#
+# The lists themselves; choose, prompt and confirm are in menu.py.
 
 def projects_of(repo: str) -> list[Project]:
     """Every real project under a repo (those with an agent file), sorted."""
@@ -993,12 +1052,30 @@ def user_hosts_menu() -> None:
             print(f"no user hosts yet ({USER_HOSTS})")
 
 
+def main_menu() -> None:
+    """Everything, from one list. This is the whole interface: git-shell
+    drops you here at login, and there is nothing to reach that is not an
+    entry (or reachable from one)."""
+    actions: list[tuple[str, Callable[[], None]]] = [
+        ("create", cmd_create),
+        ("work", repo_picker),
+        ("user hosts file", user_hosts_menu),
+        ("login", cmd_login),
+        ("update", cmd_update),
+    ]
+    while True:
+        i = choose("nacre:", [label for label, _ in actions])
+        if i is None:
+            return
+        actions[i][1]()
+
+
 def repo_picker() -> None:
     """Top level: pick a repository, then drop into its menu."""
     while True:
         repos = list_repos()
         if not repos:
-            print("no repositories yet (create one with: create <name>)")
+            print("no repositories yet (make one with: create)")
             return
         i = choose("repositories:", [repo_label(r) for r in repos])
         if i is None:
@@ -1009,7 +1086,7 @@ def repo_picker() -> None:
 def repo_menu(repo: str) -> None:
     """One repository: create a project, or pick one to manage."""
     if not (Path.home() / f"{repo}.git").is_dir():
-        die(f"no such repo: {repo} (try: create {repo})")
+        die(f"no such repo: {repo}")
     while True:
         projs = projects_of(repo)
         labels = ["new project", *(project_label(p) for p in projs)]
@@ -1036,12 +1113,9 @@ def new_project(repo: str) -> None:
     Blank accepts the suggested default; ctrl-c cancels."""
     suggestion = default_name(repo)
     while True:
-        try:
-            name = input(f"new project name [{suggestion}]: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
+        name = prompt(f"new project name [{suggestion}]: ", suggestion)
+        if name is None:
             return
-        name = name or suggestion
         if not NAME_RE.match(name):
             print("  letters, digits, . _ - only; no leading .")
             continue
@@ -1308,11 +1382,7 @@ def main(argv: list[str]) -> None:
     term = grab_terminal()
     try:
         if len(argv) == 1:
-            repo_picker()
-        elif len(argv) == 2 and argv[1] == "_hosts":
-            user_hosts_menu()
-        elif len(argv) == 2 and argv[1] == "_login":
-            cmd_login()
+            cmd_help()
         elif len(argv) == 2:
             repo_menu(check_name(argv[1]))
         else:

@@ -4,6 +4,12 @@ set -euo pipefail
 # update these commands: fetch, then pick a revision reachable from the
 # remote HEAD to switch to (roll forward or back; "> " marks the current
 # one). Checkouts are detached so any revision is reachable next time.
+#
+# This is the one command that is not nacre, and the one menu not drawn by
+# it. If a revision whose nacre does not run ever lands here, nothing in
+# that file works -- including every way back out of it -- so the way back
+# has to be a script that never touches it. That is what buys the duplicated
+# menu below; keep it in step with nacre's, and keep it standalone.
 cd "$(dirname "$0")"
 
 page=10
@@ -61,7 +67,9 @@ while :; do
 			echo
 			exit 0
 		fi
-		[ -z "$ans" ] && exit 0
+		if [ -z "$ans" ]; then
+			continue
+		fi
 		case $ans in
 		*[!0-9]*) ;;
 		*)
@@ -70,7 +78,7 @@ while :; do
 			fi
 			;;
 		esac
-		echo "  pick $lo-$i, or blank to go back"
+		echo "  pick $lo-$i"
 	done
 	if [ "$ans" -eq "$next" ]; then
 		offset=$((offset + page))

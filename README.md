@@ -5,26 +5,77 @@ sandboxed, network-policed agent sessions against them.
 
 ## Commands
 
-Everything is menu-driven — pick from a numbered list; a blank line (or Ctrl-C)
-steps back out.
+There is one command, and logging in runs it: git-shell executes `help` at
+login, `help` is a three-line exec of `nacre`, and `nacre` opens a menu.
+Everything is in that menu — repositories and their projects, creating a
+repository, the user-wide host policy, credentials, and updating these
+commands themselves.
 
-- **`update`** — update these commands themselves: fetch their repo's remote,
-  then pick a revision reachable from the remote HEAD to switch to (`>` marks
-  the current one), 10 per page. Checkouts are detached, so this rolls
-  forward or back freely
-- **`help`** — list the commands
-- **`create <name>`** — create a bare repo `<name>.git`, asking for the
-  default branch name (`main` if left blank)
-- **`list`** — list the repositories
-- **`work` / `work <repo>`** — browse repositories (each tagged
-  `running/total`) and their projects, or jump straight into one repository
-- **`hosts`** — edit or show the user-wide host policy layered under every
+```
+nacre:
+  1. repositories
+  2. create repository
+  3. user hosts
+  4. login
+  5. update
+```
+
+Pick from a numbered list; Ctrl-C (or Ctrl-D) steps back out, and a blank line
+just asks again. Backing out of the top menu lands at git-shell's own `git> `
+prompt, where `help` or `nacre` re-enters and `exit` ends the session.
+
+Any list longer than ten rows pages itself, with `prev...` at 0 and `next...`
+just past the last row; rows stay numbered 1–10 on every page, so a number means
+the same row wherever you are. Nothing opts in, so the lists that grow on their
+own — repositories, and a repository's projects — never run off the top of the
+terminal.
+
+`nacre <repo>` opens straight at one repository, skipping the picker. With no
+terminal at all — which is not how this host is used, but is what a stray
+`ssh <host> help` would get — the menu would be useless, so it prints the names
+instead.
+
+`git-shell-commands/` holds four files, but only three are commands — every
+*plain* filename in it is something a user can type, and the menu already
+reaches everything else:
+
+| file | |
+|---|---|
+| `nacre` | the menus, the policy engine, the proxy and the sandbox |
+| `help` | a three-line exec of `nacre` |
+| `update` | the deliberate exception — see below |
+| `menu.py` | the numbered lists and prompts, imported by `nacre` |
+
+`menu.py` is not a command: git-shell refuses any name containing a dot, so a
+module can sit beside the commands without becoming one. It needs nothing on
+the path — `nacre` runs from that directory, so its own directory is already
+there.
+
+### Menu entries
+
+- **repositories** — browse repositories (each tagged `running/total`) and their
+  projects; see below
+- **create repository** — create a bare repo `<name>.git`, asking for its name
+  and then its default branch (`main` if left blank)
+- **user hosts** — edit or show the user-wide host policy layered under every
   project's own (see Host policy)
-- **`login`** — renew an agent type's credentials by re-running its login
-  flow outside any sandbox. Running sessions pick the new credentials up;
-  exited ones need **resume**
+- **login** — renew an agent type's credentials by re-running its login flow
+  outside any sandbox. Running sessions pick the new credentials up; exited ones
+  need **resume**
+- **update** — update these commands themselves: fetch their repo's remote, then
+  pick a revision reachable from the remote HEAD to switch to (`>` marks the
+  current one), 10 per page. Checkouts are detached, so this rolls forward or
+  back freely; the new revision runs the next time you enter the menu
 
-### Project actions (under `work`)
+`update` is also a command of its own, and is the only thing that is not
+`nacre`. It is the way back from a revision whose `nacre` does not run: at that
+point nothing in that file works, including every route back out of it, so the
+escape hatch has to be a script that never touches it — which rules out
+importing `menu.py` as much as it rules out running `nacre`. That is why it
+keeps its own copy of the picker, and why the menu shells out to the script
+rather than duplicating it in the other direction.
+
+### Project actions (under **repositories**)
 
 From a repository you pick **new project** or an existing one; from a project
 you pick an action. Only actions valid in the project's current state are
@@ -39,7 +90,7 @@ shown:
   `ud`, `uw`) writes the decision to the user-wide file instead. Ctrl-C
   returns to the menu; the session keeps running. If the session dies instead
   (a crash, or expired credentials), watch reports it with the last log
-  lines — pointing at `login` when it looks like an auth failure — and
+  lines — pointing at **login** when it looks like an auth failure — and
   returns to the menu.
 - **resume** *(stopped)* — restart the session, then watch.
 - **stop** *(running)* — stop the session and its proxy.
@@ -116,7 +167,7 @@ Deny wins, and deny lines must come first so the file reads in precedence
 order. Malformed files are refused, never silently fixed.
 
 Besides each project's `.hosts` there is an optional user-wide policy at
-`~/.nacre/hosts` (same format, edited or shown with the `hosts` command) that
+`~/.nacre/hosts` (same format, edited or shown from the menu's **user hosts**) that
 applies to every project. The project file takes precedence: the
 user file is consulted only for hosts the project's policy does not mention at
 all, so a project `+ host` overrides a user-wide `- host` and vice versa.
@@ -137,8 +188,9 @@ pacman -S git openssh python nodejs npm bubblewrap socat iproute2
 npm install -g @anthropic-ai/claude-code
 ```
 
-Install these scripts in the git user's `~/git-shell-commands/`, executable,
-with `git-shell` as the login shell. The git user needs Claude Code
-credentials: `ANTHROPIC_API_KEY`, or stored ones from the `login` command.
+Install `nacre`, `help`, `update` and `menu.py` in the git user's
+`~/git-shell-commands/` — the three commands executable, `menu.py` not — with
+`git-shell` as the login shell. The git user needs Claude Code
+credentials: `ANTHROPIC_API_KEY`, or stored ones from the menu's **login**.
 Stored credentials expire eventually: **watch** reports the dead session when
-they do, and `login` renews them.
+they do, and **login** renews them.
